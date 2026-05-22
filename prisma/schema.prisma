@@ -1,0 +1,315 @@
+// integrations Prisma schema.
+//
+// Two halves, mirroring recon / revenue-rec's pattern:
+//
+//   1. integrations-OWNED models (Connection, SyncRun, ImportStagingRecord,
+//      ConnectorAuthState). These represent the integration engine's own
+//      bookkeeping: which third-party systems are connected, what they
+//      synced, errors, etc.
+//
+//   2. recon-mirrored models (BankAccount, BankStatement, BankStatementLine
+//      and the LegalEntity / Account that recon itself mirrors from
+//      ledger-core). MUST stay in sync with recon's schema — column for
+//      column. recon owns these tables; integrations writes to them on
+//      sync (v0.1 direct DB write; v0.2 will refactor to HTTP POST to a
+//      recon internal endpoint for symmetry with the ledger-core bridge).
+//
+// Shared DB: integrations connects with the same DATABASE_URL as
+// ledger-core, recon, and revenue-rec.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================================================
+// integrations-OWNED models
+// =========================================================================
+
+// One row per third-party account connected. e.g., "Anna's Chase
+// checking via Plaid" → one Connection row with the Plaid access_token,
+// last sync cursor, etc.
+//
+// systemCode identifies the connector (plaid, stripe, gusto, ...).
+// targetType identifies where synced data writes downstream — for v0.1
+// only BANK_ACCOUNT is supported (target = a recon BankAccount).
+model Connection {
+  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  systemCode       String           // "plaid", "stripe", "gusto", "bill_com", ...
+  displayName      String           // e.g. "Chase Operating ****1234"
+  status           ConnectionStatus @default(ACTIVE)
+
+  // The downstream object this connection feeds. v0.1: BANK_ACCOUNT
+  // points at a recon BankAccount; v0.2 will add PARTY, GL_ACCOUNT,
+  // VENDOR, etc. for other connectors.
+  targetType       ConnectionTargetType
+  targetId         String?          @db.Uuid
+
+  // Connector-specific credentials. JSON blob — shape depends on
+  // systemCode. For Plaid: { accessToken, itemId, institutionId,
+  // institutionName, accountId }. Never logged; the engine treats it
+  // as opaque.
+  credentialsJson  Json
+
+  // Last sync cursor (connector-defined string). For Plaid:
+  // /transactions/sync returns a `next_cursor` we pass back on the
+  // next call to get only new/updated transactions since.
+  lastCursor       String?
+  lastSyncedAt    DateTime?
+  lastSyncStatus  SyncStatus?
+
+  // Connection metadata. createdBy is the actor (User UUID or "system").
+  createdBy        String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  deactivatedAt    DateTime?
+
+  syncRuns         SyncRun[]
+
+  @@unique([systemCode, targetId])
+  @@index([status, systemCode])
+  @@map("connection")
+}
+
+enum ConnectionStatus {
+  ACTIVE        // syncs happen on schedule
+  PAUSED        // connection exists but sync is off (auth needs refresh, etc.)
+  REVOKED       // user disconnected; tokens may be invalid
+  ERROR         // last sync failed; needs admin attention
+}
+
+enum ConnectionTargetType {
+  BANK_ACCOUNT  // → recon BankAccount (Plaid for now)
+  // v0.2+: PARTY, GL_ACCOUNT, VENDOR, EMPLOYEE
+}
+
+// One row per sync attempt. Append-only; never edited. Captures what
+// happened on each run for the admin sync log + debugging.
+model SyncRun {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  connectionId    String      @db.Uuid
+  connection      Connection  @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  startedAt       DateTime    @default(now())
+  completedAt     DateTime?
+  status          SyncStatus  @default(RUNNING)
+
+  // How the sync was triggered. MANUAL = user clicked "sync now";
+  // SCHEDULED = cron job (v0.2); WEBHOOK = inbound webhook (v0.2).
+  triggerType     SyncTriggerType
+
+  // Cursor state. cursorBefore = what we passed to the connector;
+  // cursorAfter = what the connector returned for next time.
+  cursorBefore    String?
+  cursorAfter     String?
+
+  // Aggregate counts. recordsAdded includes new records the connector
+  // reported; recordsModified = updates; recordsRemoved = soft-deletes
+  // (the connector signaled the record is no longer valid).
+  recordsAdded    Int         @default(0)
+  recordsModified Int         @default(0)
+  recordsRemoved  Int         @default(0)
+
+  // For failures.
+  errorCode       String?
+  errorMessage    String?
+
+  // Backref to the staging records this run ingested. Cleaned up
+  // after successful downstream write.
+  stagedRecords   ImportStagingRecord[]
+
+  @@index([connectionId, startedAt])
+  @@map("sync_run")
+}
+
+enum SyncStatus {
+  RUNNING
+  SUCCESS
+  PARTIAL_SUCCESS  // some records failed downstream write but cursor advanced
+  FAILURE          // sync failed; cursor NOT advanced
+}
+
+enum SyncTriggerType {
+  MANUAL
+  SCHEDULED
+  WEBHOOK
+}
+
+// Staging table for records pulled from a connector but not yet
+// promoted to the downstream system (recon, ledger-core, etc.).
+// Acts as a buffer for retries + auditing — if the downstream write
+// fails, the staged row sticks around to retry.
+//
+// rawPayload is the original, verbatim record from the connector.
+// Frozen, for re-mapping when the mapper logic evolves.
+model ImportStagingRecord {
+  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  syncRunId       String      @db.Uuid
+  syncRun         SyncRun     @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
+
+  // The connector's external id for this record. Used for idempotency:
+  // re-running a sync should NOT create duplicates.
+  externalId      String
+
+  // Raw record from the connector (frozen). For Plaid: the full
+  // Transaction object as returned by /transactions/sync.
+  rawPayload      Json
+
+  // After mapping. Shape varies by connection.targetType.
+  // For BANK_ACCOUNT: a BankStatementLine-shaped object.
+  mappedPayload   Json?
+
+  // Status of the downstream write.
+  writeStatus     StagingWriteStatus @default(PENDING)
+  writeError      String?
+  writtenRecordId String?            @db.Uuid
+
+  createdAt       DateTime    @default(now())
+  writtenAt       DateTime?
+
+  @@unique([syncRunId, externalId])
+  @@index([writeStatus, createdAt])
+  @@map("import_staging_record")
+}
+
+enum StagingWriteStatus {
+  PENDING      // sync ingested it but downstream write hasn't happened
+  WRITTEN      // promoted to downstream successfully
+  FAILED       // downstream write errored; will be retried
+  SKIPPED      // intentional skip (e.g., duplicate detected, filtered out)
+}
+
+// =========================================================================
+// recon mirror — DO NOT EDIT without syncing recon's schema upstream
+// =========================================================================
+//
+// integrations writes to BankStatement + BankStatementLine on each Plaid
+// sync. This is a write into recon's owned tables — same arrangement as
+// recon writing to its own tables in v0.1. In v0.2 we'll refactor to POST
+// to a recon internal endpoint (the symmetric pattern to ledger-core's
+// /api/internal/journal-entries).
+
+model LegalEntity {
+  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  code                 String   @unique
+  name                 String
+  parentEntityId       String?  @db.Uuid
+  functionalCurrencyId String
+  sourceSystem         String?
+  sourceRecordType     String?
+  sourceRecordId       String?
+  sourcePayload        Json?
+  mappingVersion       String?
+  extensions           Json?
+
+  bankAccounts BankAccount[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("legal_entity")
+}
+
+model Account {
+  id               String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entityId         String? @db.Uuid
+  code             String
+  name             String
+  type             String
+  normalBalance    String
+  subtype          String?
+  isContra         Boolean @default(false)
+  isControlAccount Boolean @default(false)
+  isBank           Boolean @default(false)
+  parentAccountId  String? @db.Uuid
+  bookScope        String[] @default([])
+  active           Boolean @default(true)
+
+  bankAccounts BankAccount[]
+
+  sourceSystem     String?
+  sourceRecordType String?
+  sourceRecordId   String?
+  sourcePayload    Json?
+  mappingVersion   String?
+  extensions       Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([entityId, code])
+  @@map("account")
+}
+
+model BankAccount {
+  id                 String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entityId           String  @db.Uuid
+  entity             LegalEntity @relation(fields: [entityId], references: [id])
+  accountId          String  @db.Uuid
+  account            Account     @relation(fields: [accountId], references: [id])
+
+  code               String  @unique
+  displayName        String
+  bankName           String?
+  accountNumberLast4 String?
+  currencyId         String  @default("USD")
+  isActive           Boolean @default(true)
+
+  statements         BankStatement[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("bank_account")
+}
+
+model BankStatement {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bankAccountId   String   @db.Uuid
+  bankAccount     BankAccount @relation(fields: [bankAccountId], references: [id])
+
+  filename        String
+  uploadedAt      DateTime @default(now())
+  uploadedBy      String?
+  format          String   // e.g. "PLAID_SYNC_V1" for integrations-imported statements
+  rawPayload      String
+
+  periodStart     DateTime @db.Date
+  periodEnd       DateTime @db.Date
+  openingBalance  Decimal  @db.Decimal(18, 4)
+  closingBalance  Decimal  @db.Decimal(18, 4)
+
+  lines           BankStatementLine[]
+
+  totalLines      Int @default(0)
+  matchedLines    Int @default(0)
+  pendingLines    Int @default(0)
+
+  @@index([bankAccountId, periodEnd])
+  @@map("bank_statement")
+}
+
+model BankStatementLine {
+  id              String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  statementId     String @db.Uuid
+  statement       BankStatement @relation(fields: [statementId], references: [id], onDelete: Cascade)
+
+  lineNo          Int
+  transactionDate DateTime @db.Date
+  postedDate      DateTime? @db.Date
+  description     String
+  amount          Decimal @db.Decimal(18, 4)
+  runningBalance  Decimal? @db.Decimal(18, 4)
+  externalRef     String?
+
+  status          String @default("UNMATCHED")
+
+  @@unique([statementId, lineNo])
+  @@index([statementId, status])
+  @@index([transactionDate])
+  @@map("bank_statement_line")
+}

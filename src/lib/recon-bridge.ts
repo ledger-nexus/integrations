@@ -1,28 +1,27 @@
-// recon write bridge. v0.1 writes directly to recon's BankStatement +
-// BankStatementLine tables via the shared Postgres database (mirror
-// approach — same as recon and revenue-rec writing to their owned
-// tables in their own schemas, since all three repos share one DB).
+// recon write bridge.
 //
-// v0.2 will refactor to POST to a recon internal HTTP endpoint
-// (mirror of ledger-core's /api/internal/journal-entries), making
-// integrations a clean API consumer of recon. The function signatures
-// here are shaped so the refactor changes the implementation without
-// touching callers.
+// v0.2 (current): HTTP client to recon's POST /api/internal/bank-lines
+// endpoint. Mirrors ledger-core's /api/internal/journal-entries pattern.
+// Closes the v0.1 "direct DB write" scoped exception.
+//
+// Idempotency is server-side (recon dedupes by externalRef before
+// inserting). A connector that resends the same Plaid transactions
+// across overlapping sync windows produces zero duplicate rows.
 //
 // Why bundle Plaid sync writes into a BankStatement at all (vs. just
 // writing line rows)? Because recon's matching workflow + reports
 // expect a BankStatement parent. We synthesize one per sync run:
-//   - filename = "plaid-sync-<runId>.json"
-//   - format = "PLAID_SYNC_V1"
-//   - rawPayload = JSON of the sync run's record set
+//   - filename = "<format>-<runId>.json"
+//   - format = "PLAID_SYNC_V1" (sender-supplied)
+//   - rawPayload = JSON of the run's record set (synthesized server-side)
 //   - period = min..max transaction date
-//   - balances = derived from the period's running sum (v0.1 starts at 0;
+//   - balances = derived from the period's signed sum (v0.1 starts at 0;
 //     a full implementation would fetch Plaid /accounts/get for actual
 //     balances)
 
-import { Decimal } from "decimal.js";
-import { prisma } from "@/lib/db";
 import type { MappedBankLine } from "@/lib/connectors/plaid/mapper";
+
+const DEFAULT_RECON_URL = "http://localhost:3001";
 
 export interface PromoteToBankStatementInput {
   /** recon BankAccount.id this Plaid Connection feeds. */
@@ -40,15 +39,33 @@ export interface PromoteResult {
   lineCount: number;
 }
 
+export type ReconErrorCode =
+  | "UNAUTHORIZED"
+  | "BAD_REQUEST"
+  | "UNKNOWN_BANK_ACCOUNT"
+  | "INTERNAL_ERROR"
+  | "TRANSPORT_ERROR";
+
+export class ReconBridgeError extends Error {
+  constructor(public code: ReconErrorCode, message: string, public status?: number) {
+    super(message);
+    this.name = "ReconBridgeError";
+  }
+}
+
+let _fetchOverride: typeof fetch | null = null;
+export function setFetchForTesting(fn: typeof fetch | null): void {
+  _fetchOverride = fn;
+}
+
 /**
- * Promote a batch of mapped Plaid transactions into a new recon
- * BankStatement + BankStatementLines. Idempotent at the per-record
- * level via externalRef (the Plaid transaction_id) — re-running a
- * sync with overlapping records does NOT create duplicates.
+ * Promote a batch of mapped Plaid transactions into recon as a new
+ * BankStatement + BankStatementLines. Server-side dedup by externalRef
+ * (Plaid transaction_id) guarantees idempotency across overlapping
+ * sync windows.
  *
- * Implementation note: when the batch is empty (zero new transactions
- * since cursor), we DO NOT create an empty BankStatement. Returns
- * lineCount=0 and a synthetic id.
+ * If the batch is empty, returns `lineCount=0` and a synthetic id —
+ * the endpoint short-circuits before creating an empty BankStatement.
  */
 export async function promoteToBankStatement(
   input: PromoteToBankStatementInput
@@ -57,81 +74,76 @@ export async function promoteToBankStatement(
     return { bankStatementId: "<empty>", lineCount: 0 };
   }
 
-  // 1. Sort + derive period bounds.
-  const sorted = [...input.lines].sort(
-    (a, b) => a.transactionDate.getTime() - b.transactionDate.getTime()
-  );
-  const periodStart = sorted[0].transactionDate;
-  const periodEnd = sorted[sorted.length - 1].transactionDate;
-
-  // 2. Compute simple running balance. v0.1 starts the synthesized
-  // statement at opening = 0; closing = sum of signed amounts. This
-  // doesn't match the bank's actual opening — the matcher doesn't
-  // care, but reports do. v0.2 will fetch Plaid /accounts/get for
-  // real balances.
-  const sumSigned = sorted.reduce(
-    (acc, l) => acc.plus(l.amount),
-    new Decimal(0)
-  );
-
-  // 3. Filter out records that ALREADY exist (idempotency). recon's
-  // BankStatementLine has externalRef which we populate with the Plaid
-  // transaction_id. Existing rows are skipped — the batch shrinks.
-  const externalIds = sorted.map((l) => l.externalId);
-  const alreadyImported = await prisma.bankStatementLine.findMany({
-    where: { externalRef: { in: externalIds } },
-    select: { externalRef: true },
-  });
-  const seenIds = new Set(
-    alreadyImported.map((r) => r.externalRef).filter((x): x is string => !!x)
-  );
-  const fresh = sorted.filter((l) => !seenIds.has(l.externalId));
-
-  if (fresh.length === 0) {
-    return { bankStatementId: "<empty-after-dedup>", lineCount: 0 };
+  const baseUrl = process.env.RECON_URL ?? DEFAULT_RECON_URL;
+  const token = process.env.RECON_INTERNAL_API_TOKEN;
+  if (!token) {
+    throw new ReconBridgeError(
+      "UNAUTHORIZED",
+      "RECON_INTERNAL_API_TOKEN is not set in integrations' env — cannot post to recon"
+    );
   }
 
-  // 4. Write the BankStatement + lines in one transaction.
-  const filename = `plaid-sync-${input.syncRunId.slice(0, 8)}.json`;
-  const rawPayload = JSON.stringify(
-    fresh.map((l) => ({
+  const body = {
+    bankAccountId: input.bankAccountId,
+    syncRunId: input.syncRunId,
+    format: "PLAID_SYNC_V1",
+    uploadedBy: input.uploadedBy ?? "plaid-sync",
+    lines: input.lines.map((l) => ({
       externalId: l.externalId,
-      date: l.transactionDate.toISOString().slice(0, 10),
-      amount: l.amount.toString(),
+      transactionDate: l.transactionDate.toISOString().slice(0, 10),
       description: l.description,
+      amount: l.amount.toString(),
       pending: l.pending,
     })),
-    null,
-    2
-  );
+  };
 
-  const statement = await prisma.bankStatement.create({
-    data: {
-      bankAccountId: input.bankAccountId,
-      filename,
-      format: "PLAID_SYNC_V1",
-      rawPayload,
-      uploadedBy: input.uploadedBy ?? "plaid-sync",
-      periodStart,
-      periodEnd,
-      openingBalance: "0.0000",
-      closingBalance: sumSigned.toFixed(4),
-      totalLines: fresh.length,
-      matchedLines: 0,
-      pendingLines: fresh.length,
-      lines: {
-        create: fresh.map((l, idx) => ({
-          lineNo: idx + 1,
-          transactionDate: l.transactionDate,
-          description: l.description,
-          amount: l.amount.toFixed(4),
-          externalRef: l.externalId,
-          status: "UNMATCHED",
-        })),
-      },
-    },
-    select: { id: true },
-  });
+  const fetchFn = _fetchOverride ?? fetch;
+  let res: Response;
+  try {
+    res = await fetchFn(`${baseUrl}/api/internal/bank-lines`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new ReconBridgeError(
+      "TRANSPORT_ERROR",
+      `Failed to reach recon at ${baseUrl}: ${e instanceof Error ? e.message : "Unknown error"}`
+    );
+  }
 
-  return { bankStatementId: statement.id, lineCount: fresh.length };
+  type ApiResponse =
+    | {
+        ok: true;
+        bankStatementId: string | null;
+        linesCreated: number;
+        linesSkipped: number;
+        wasEmpty: boolean;
+      }
+    | { ok: false; error: { code: ReconErrorCode; message: string } };
+
+  let payload: ApiResponse;
+  try {
+    payload = (await res.json()) as ApiResponse;
+  } catch {
+    throw new ReconBridgeError(
+      "TRANSPORT_ERROR",
+      `recon returned non-JSON response (status ${res.status})`,
+      res.status
+    );
+  }
+
+  if (!payload.ok) {
+    throw new ReconBridgeError(payload.error.code, payload.error.message, res.status);
+  }
+
+  // Map the server-side response back to the caller's shape. The
+  // caller (sync runner) wants `bankStatementId` and `lineCount`;
+  // when all lines were duplicates the server returns id=null —
+  // expose a synthetic marker so the runner's existing "<empty>"
+  // checks still work without changes.
+  return {
+    bankStatementId: payload.bankStatementId ?? "<empty-after-dedup>",
+    lineCount: payload.linesCreated,
+  };
 }

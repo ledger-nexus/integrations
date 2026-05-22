@@ -16,7 +16,7 @@ The architecture canon is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Read i
 
 2. **Connector mappers are pure functions.** No I/O, no DB access. Mapping is `(raw: TRecord) => TMapped` and gets unit-tested in isolation. Mapper version is stamped on every staged row.
 
-3. **Engine writes downstream via HTTP bridges (eventually).** v0.1 writes directly to recon's `BankStatement` + `BankStatementLine` via the shared DB. v0.2 refactors to `POST /api/internal/bank-lines` (mirror of ledger-core's `/api/internal/journal-entries`). The Server-Action API stays the same; only `src/lib/recon-bridge.ts` changes.
+3. **Engine writes downstream via HTTP bridges.** integrations POSTs mapped records to recon's `POST /api/internal/bank-lines` endpoint (token-gated, mirror of ledger-core's `/api/internal/journal-entries`). NO direct DB writes to recon's owned tables; the bridge in `src/lib/recon-bridge.ts` is an HTTP client only. Server-side dedup by `externalRef` makes overlapping sync windows safe.
 
 4. **No flow engine.** Per-event handlers in TypeScript code, not a visual flow builder. Zapier / Make / n8n already do that; our value is the deep, accounting-aware connectors.
 

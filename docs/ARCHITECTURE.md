@@ -103,16 +103,14 @@ The engine (sync runner, webhook router) is recordType-agnostic. It dispatches o
 
 ## Cross-repo write story
 
-**v0.1 (current)**: integrations writes directly to recon's `BankStatement` + `BankStatementLine` via the shared Postgres database. This is the same pattern recon and revenue-rec use to write to their own owned tables. It works because the four repos share one DB.
+**v0.2 (current)**: integrations POSTs to recon's `POST /api/internal/bank-lines` endpoint — symmetric with ledger-core's existing `/api/internal/journal-entries` HTTP boundary. The endpoint is token-gated (`RECON_INTERNAL_API_TOKEN`), dedupes per-line by `externalRef` (Plaid `transaction_id`) before insert, and synthesizes a `BankStatement` parent per call. After this refactor:
 
-**v0.2 (planned)**: refactor to POST to a new `POST /api/internal/bank-lines` endpoint on recon. Symmetric with ledger-core's existing `/api/internal/journal-entries` HTTP boundary that recon and revenue-rec use today. After the refactor:
+- integrations still mirrors recon's bank_* schema in Prisma BUT only reads from it (for the `Connection.targetId` → BankAccount lookup at connect time); writes are 100% HTTP.
+- recon learns about each data source (filename, format, sync run id) explicitly through the wire contract.
+- integrations can be deployed independently of recon (just point `RECON_URL` at the right host).
+- recon can audit / log inbound writes the same way it audits journal-entry writes.
 
-- integrations no longer mirrors recon's bank_* schema (the wire contract is the API, not the table)
-- recon learns about each data source (filename, format, sync run id) explicitly
-- integrations can be deployed independently of recon
-- recon can audit / log inbound writes the same way it audits journal-entry writes
-
-The Server-Action API in `src/lib/recon-bridge.ts` is shaped so the refactor changes the implementation without touching callers.
+**v0.1 (historical)**: integrations wrote directly to recon's `BankStatement` + `BankStatementLine` via the shared Postgres database. This was the same shape as recon's pre-bridge "shared DB" period and was always intended to be temporary. The bridge function name and signature (`promoteToBankStatement`) stayed identical across the refactor, so callers needed zero changes.
 
 ## Plaid choice + architecture for v0.1
 

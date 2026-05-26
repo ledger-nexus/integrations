@@ -195,7 +195,10 @@ enum StagingWriteStatus {
 
 model LegalEntity {
   id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  code                 String   @unique
+  // Phase 4b in ledger-core: code is unique per [tenantId, code], not globally.
+  // integrations' mirror doesn't carry tenantId (read-only here), so we just
+  // drop the global @unique. Callers use findFirst.
+  code                 String
   name                 String
   parentEntityId       String?  @db.Uuid
   functionalCurrencyId String

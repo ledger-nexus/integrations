@@ -8,9 +8,26 @@ import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatRelativeTime } from "@/lib/utils/format";
 import { TriggerSyncButton } from "./trigger-sync-button";
+import { getCurrentTenant } from "@/lib/auth/session";
 
 export default async function ConnectionsListPage() {
+  // SECURITY (pen-test pass 4 follow-up): tenant-scope the enumeration.
+  // Connection has no direct tenantId column, so we walk
+  // Connection.targetId → BankAccount.entity.tenantId. This mirrors how
+  // triggerSyncAction tenant-checks the connection it's about to sync.
+  const tenant = await getCurrentTenant();
+  const tenantBankAccountIds = tenant
+    ? (
+        await prisma.bankAccount.findMany({
+          where: { entity: { tenantId: tenant.id } },
+          select: { id: true },
+        })
+      ).map((b) => b.id)
+    : [];
   const connections = await prisma.connection.findMany({
+    where: tenant
+      ? { targetType: "BANK_ACCOUNT", targetId: { in: tenantBankAccountIds } }
+      : { id: "__none__" },
     orderBy: [{ status: "asc" }, { createdAt: "desc" }],
     select: {
       id: true,

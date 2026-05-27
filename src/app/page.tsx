@@ -7,10 +7,36 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatRelativeTime } from "@/lib/utils/format";
+import { getCurrentTenant } from "@/lib/auth/session";
 
 export default async function DashboardPage() {
+  // SECURITY (pen-test pass 4 follow-up): tenant-scope the dashboard.
+  // Connection has no tenantId column; walk Connection.targetId →
+  // BankAccount.entity.tenantId. SyncRun filters by connectionId in
+  // that scope.
+  const tenant = await getCurrentTenant();
+  const tenantBankAccountIds = tenant
+    ? (
+        await prisma.bankAccount.findMany({
+          where: { entity: { tenantId: tenant.id } },
+          select: { id: true },
+        })
+      ).map((b) => b.id)
+    : [];
+  const connectionWhere = tenant
+    ? { targetType: "BANK_ACCOUNT" as const, targetId: { in: tenantBankAccountIds } }
+    : { id: "__none__" };
+  const tenantConnectionIds = tenant
+    ? (
+        await prisma.connection.findMany({
+          where: connectionWhere,
+          select: { id: true },
+        })
+      ).map((c) => c.id)
+    : [];
   const [connections, recentRuns] = await Promise.all([
     prisma.connection.findMany({
+      where: connectionWhere,
       orderBy: [{ status: "asc" }, { lastSyncedAt: "desc" }],
       take: 20,
       select: {
@@ -23,6 +49,9 @@ export default async function DashboardPage() {
       },
     }),
     prisma.syncRun.findMany({
+      where: tenant
+        ? { connectionId: { in: tenantConnectionIds } }
+        : { id: "__none__" },
       orderBy: { startedAt: "desc" },
       take: 10,
       select: {

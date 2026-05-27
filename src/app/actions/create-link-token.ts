@@ -5,10 +5,17 @@
 // directly with this token; no further server round trip needed until
 // the user finishes the bank login.
 //
-// Auth: v0.1 trusts whoever's on the dev box. v0.2+ should require a
-// real user via the same getCurrentUser pattern as ledger-core.
+// SECURITY (pen-test pass 4): requires a signed-in user. Without the
+// auth gate, an attacker could mint unlimited Plaid Link tokens —
+// burning the Plaid quota and creating a billable-event DoS. The
+// minted user id passed to Plaid is now the real authenticated user
+// (was a hardcoded "integrations-dev-user").
 
 import { plaidConnector } from "@/lib/connectors/plaid/connector";
+import {
+  requireCurrentUser,
+  NotAuthenticatedError,
+} from "@/lib/auth/session";
 
 export interface CreateLinkTokenState {
   ok: boolean;
@@ -18,18 +25,20 @@ export interface CreateLinkTokenState {
 
 export async function createLinkTokenAction(): Promise<CreateLinkTokenState> {
   try {
-    // The user id passed to Plaid is for THEIR rate limiting + audit;
-    // doesn't have to match our system's user id. In dev we just pass
-    // a constant. In production this becomes session.user.id.
+    const user = await requireCurrentUser();
+
     const result = await plaidConnector.initiateAuth({
       redirectUri: "", // Plaid Link is embedded, not redirect-based
-      actorUserId: "integrations-dev-user",
+      actorUserId: user.id,
     });
     if (!result.linkToken) {
       return { ok: false, message: "Plaid connector returned no link token" };
     }
     return { ok: true, linkToken: result.linkToken };
   } catch (e) {
+    if (e instanceof NotAuthenticatedError) {
+      return { ok: false, message: "You must be signed in to connect a bank account." };
+    }
     return {
       ok: false,
       message: e instanceof Error ? e.message : "Unknown error minting link token",

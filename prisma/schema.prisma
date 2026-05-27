@@ -195,9 +195,9 @@ enum StagingWriteStatus {
 
 model LegalEntity {
   id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  // Phase 4b in ledger-core: code is unique per [tenantId, code], not globally.
-  // integrations' mirror doesn't carry tenantId (read-only here), so we just
-  // drop the global @unique. Callers use findFirst.
+  // SECURITY (pen-test pass 4): tenantId added so Server Actions
+  // can tenant-scope record lookups. Column exists in shared DB.
+  tenantId             String   @db.Uuid
   code                 String
   name                 String
   parentEntityId       String?  @db.Uuid
@@ -315,4 +315,36 @@ model BankStatementLine {
   @@index([statementId, status])
   @@index([transactionDate])
   @@map("bank_statement_line")
+}
+
+// Shared multi-tenancy mirror (pen-test pass 4).
+model User {
+  id          String  @id @db.Uuid
+  email       String  @unique
+  displayName String
+  isActive    Boolean @default(true)
+  memberships TenantMembership[]
+
+  @@map("app_user")
+}
+
+model Tenant {
+  id          String  @id @db.Uuid
+  slug        String  @unique
+  name        String
+  memberships TenantMembership[]
+
+  @@map("tenant")
+}
+
+model TenantMembership {
+  tenantId String @db.Uuid
+  userId   String @db.Uuid
+  role     String
+
+  tenant Tenant @relation(fields: [tenantId], references: [id])
+  user   User   @relation(fields: [userId], references: [id])
+
+  @@unique([tenantId, userId])
+  @@map("tenant_membership")
 }

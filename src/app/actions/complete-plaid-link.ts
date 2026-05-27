@@ -15,6 +15,12 @@ import { revalidatePath } from "next/cache";
 import { prisma } from "@/lib/db";
 import { plaidConnector } from "@/lib/connectors/plaid/connector";
 import { runConnectionSync } from "@/lib/sync/runner";
+import {
+  requireCurrentUser,
+  requireCurrentTenant,
+  NotAuthenticatedError,
+  NoTenantSelectedError,
+} from "@/lib/auth/session";
 
 export interface CompletePlaidLinkInput {
   /** Plaid Link's onSuccess callback gives us this. */
@@ -39,6 +45,9 @@ export async function completePlaidLinkAction(
   input: CompletePlaidLinkInput
 ): Promise<CompletePlaidLinkState> {
   try {
+    const user = await requireCurrentUser();
+    const tenant = await requireCurrentTenant();
+
     if (!input.publicToken) {
       return { ok: false, message: "publicToken required" };
     }
@@ -46,13 +55,20 @@ export async function completePlaidLinkAction(
       return { ok: false, message: "bankAccountId required" };
     }
 
-    // 1. Verify the target BankAccount exists.
-    const bankAccount = await prisma.bankAccount.findUnique({
-      where: { id: input.bankAccountId },
+    // SECURITY (pen-test pass 4): tenant-scope the BankAccount lookup.
+    // CRITICAL FIX — without this, an attacker could bind a Plaid
+    // accessToken to a foreign tenant's BankAccount; subsequent sync
+    // runs would import the attacker's transactions into the victim's
+    // recon books, polluting reconciliation.
+    const bankAccount = await prisma.bankAccount.findFirst({
+      where: {
+        id: input.bankAccountId,
+        entity: { tenantId: tenant.id },
+      },
       select: { id: true, code: true, displayName: true },
     });
     if (!bankAccount) {
-      return { ok: false, message: "Target BankAccount not found in recon" };
+      return { ok: false, message: "Target BankAccount not found in this tenant" };
     }
 
     // 2. Exchange the public_token + persist credentials.
@@ -75,7 +91,7 @@ export async function completePlaidLinkAction(
         targetType: "BANK_ACCOUNT",
         targetId: bankAccount.id,
         credentialsJson: auth.credentials as object,
-        createdBy: "integrations-dev-user",
+        createdBy: user.email,
       },
       select: { id: true },
     });
@@ -103,6 +119,10 @@ export async function completePlaidLinkAction(
       ...initialSyncResult,
     };
   } catch (e) {
+    if (e instanceof NotAuthenticatedError)
+      return { ok: false, message: "You must be signed in to connect a bank feed." };
+    if (e instanceof NoTenantSelectedError)
+      return { ok: false, message: e.message };
     return {
       ok: false,
       message: e instanceof Error ? e.message : "Unknown error completing Plaid Link",

@@ -22,8 +22,8 @@ describe("plaidConnector: ConnectorMeta", () => {
   it("declares correct capabilities for v0.1", () => {
     // Polling is the v0.1 sync model.
     expect(plaidConnector.meta.capabilities.polling).toBe(true);
-    // Webhooks land in v0.2.
-    expect(plaidConnector.meta.capabilities.webhook).toBe(false);
+    // Webhooks landed in v0.2.
+    expect(plaidConnector.meta.capabilities.webhook).toBe(true);
     // Plaid is read-only; no push support.
     expect(plaidConnector.meta.capabilities.push).toBe(false);
   });
@@ -47,16 +47,16 @@ describe("plaidConnector: required methods present", () => {
   });
 });
 
-describe("plaidConnector: optional methods correctly absent (v0.1)", () => {
-  it("does NOT implement pushRecord (push=false)", () => {
+describe("plaidConnector: optional methods", () => {
+  it("does NOT implement pushRecord (push=false; Plaid is read-only)", () => {
     expect(plaidConnector.pushRecord).toBeUndefined();
   });
 
-  it("does NOT implement verifyWebhookSignature (webhook=false)", () => {
-    expect(plaidConnector.verifyWebhookSignature).toBeUndefined();
+  it("implements parseWebhookEvent (webhook=true, v0.2)", () => {
+    expect(typeof plaidConnector.parseWebhookEvent).toBe("function");
   });
 
-  it("does NOT implement parseWebhookEvent (webhook=false)", () => {
-    expect(plaidConnector.parseWebhookEvent).toBeUndefined();
+  it("does NOT YET implement verifyWebhookSignature (URL-token shared secret is the v1 auth; JWT verification ships in a follow-up)", () => {
+    expect(plaidConnector.verifyWebhookSignature).toBeUndefined();
   });
 });

@@ -31,6 +31,8 @@ import type {
   CompleteAuthResult,
   FetchSinceInput,
   FetchPage,
+  ParseWebhookInput,
+  ParseWebhookResult,
 } from "../interface";
 
 const META: ConnectorMeta = {
@@ -39,10 +41,12 @@ const META: ConnectorMeta = {
   targetType: "BANK_ACCOUNT",
   capabilities: {
     polling: true,
-    // Webhook receivers ship in v0.2. The Plaid product fires
-    // TRANSACTIONS_UPDATES_AVAILABLE events that we'd use to trigger
-    // an immediate sync; v0.1 syncs are manually invoked from the UI.
-    webhook: false,
+    // Webhook receivers (v0.2). Plaid fires TRANSACTIONS webhooks
+    // (SYNC_UPDATES_AVAILABLE for the modern /transactions/sync flow,
+    // DEFAULT_UPDATE for the legacy flow). The receiver lives at
+    // /api/plaid/webhook and parseWebhookEvent below converts the
+    // payload into the engine's "needs immediate fetch" signal.
+    webhook: true,
     // Push (writing back to Plaid) isn't a thing — Plaid is read-only.
     push: false,
   },
@@ -178,6 +182,58 @@ export const plaidConnector: Connector<PlaidTransaction> = {
       if (!response.has_more) break;
       cursor = response.next_cursor;
     }
+  },
+
+  /**
+   * Parse a Plaid webhook payload. Plaid's transactions webhooks are
+   * NOTIFICATIONS — they signal "new transactions available" rather
+   * than carrying the records themselves. So this returns an empty
+   * records array and sets needsImmediateFetch=true, which the engine
+   * uses to trigger an immediate fetchSince() against the cursor.
+   *
+   * The route handler (/api/plaid/webhook) is responsible for matching
+   * the payload's item_id to a Connection BEFORE calling this — the
+   * connector itself is item-agnostic.
+   *
+   * Webhook codes handled:
+   *   - TRANSACTIONS / SYNC_UPDATES_AVAILABLE (modern /transactions/sync)
+   *   - TRANSACTIONS / DEFAULT_UPDATE (legacy)
+   *   - TRANSACTIONS / INITIAL_UPDATE, HISTORICAL_UPDATE (first-time
+   *     sync ready; same response — trigger fetch)
+   *
+   * Codes that don't trigger a sync:
+   *   - TRANSACTIONS_REMOVED — handled by the next /transactions/sync
+   *     call returning removed records (the route handler may still
+   *     trigger an immediate sync to flush them)
+   *   - ITEM / ERROR — handled in the route handler (mark connection
+   *     ERROR), not here
+   */
+  parseWebhookEvent(
+    input: ParseWebhookInput<PlaidTransaction>
+  ): Promise<ParseWebhookResult<PlaidTransaction>> {
+    const body = input.body as
+      | {
+          webhook_type?: string;
+          webhook_code?: string;
+        }
+      | null;
+
+    if (!body || typeof body !== "object") {
+      return Promise.resolve({ records: [], needsImmediateFetch: false });
+    }
+
+    const isTransactionsSync =
+      body.webhook_type === "TRANSACTIONS" &&
+      (body.webhook_code === "SYNC_UPDATES_AVAILABLE" ||
+        body.webhook_code === "DEFAULT_UPDATE" ||
+        body.webhook_code === "INITIAL_UPDATE" ||
+        body.webhook_code === "HISTORICAL_UPDATE" ||
+        body.webhook_code === "TRANSACTIONS_REMOVED");
+
+    return Promise.resolve({
+      records: [],
+      needsImmediateFetch: isTransactionsSync,
+    });
   },
 
   // No refresh needed — Plaid access_tokens don't expire. (Items can

@@ -69,6 +69,7 @@ model Connection {
   deactivatedAt    DateTime?
 
   syncRuns         SyncRun[]
+  plaidWebhookEvents PlaidWebhookEvent[]
 
   @@unique([systemCode, targetId])
   @@index([status, systemCode])
@@ -131,6 +132,50 @@ enum SyncStatus {
   SUCCESS
   PARTIAL_SUCCESS  // some records failed downstream write but cursor advanced
   FAILURE          // sync failed; cursor NOT advanced
+}
+
+/// Audit trail for inbound Plaid webhooks. Every received payload
+/// persists here regardless of whether it triggered a sync — gives
+/// the operator a way to debug "did Plaid actually send us X?".
+///
+/// Idempotency: webhooks are routinely re-delivered (Plaid retries
+/// on non-2xx for 24h). We don't currently dedupe by request id;
+/// the downstream effect (triggerSync) is itself idempotent via the
+/// Plaid /transactions/sync cursor, so a repeated TRANSACTIONS webhook
+/// just produces one or zero new records.
+model PlaidWebhookEvent {
+  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// The Connection this webhook was for, resolved by Plaid item_id.
+  /// Null when the webhook is unrouted (item_id didn't match any
+  /// active Connection — usually a stale webhook from a removed item).
+  connectionId    String?  @db.Uuid
+  connection      Connection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+
+  /// Plaid's item_id from the payload. Preserved even when connectionId
+  /// is null so the operator can debug unrouted events.
+  plaidItemId     String
+
+  webhookType     String   // e.g. "TRANSACTIONS", "ITEM"
+  webhookCode     String   // e.g. "SYNC_UPDATES_AVAILABLE", "ERROR"
+
+  /// Verbatim payload as Plaid sent it.
+  rawPayload      Json
+  /// Was a sync triggered as a result?
+  triggeredSync   Boolean  @default(false)
+  /// SyncRun id if triggeredSync (or null if no sync fired or it failed
+  /// before the run row was created).
+  syncRunId       String?  @db.Uuid
+
+  /// Why the webhook was acted on (or skipped). Free-form for
+  /// auditing.
+  outcome         String   // "SYNC_TRIGGERED" / "ITEM_ERROR_RECORDED" / "IGNORED" / "FAILED"
+  outcomeMessage  String?
+
+  receivedAt      DateTime @default(now())
+
+  @@index([connectionId, receivedAt])
+  @@index([plaidItemId, receivedAt])
+  @@map("plaid_webhook_event")
 }
 
 enum SyncTriggerType {

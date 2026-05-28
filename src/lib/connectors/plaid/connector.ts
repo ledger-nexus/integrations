@@ -20,6 +20,7 @@ import {
   getAccounts,
   transactionsSync,
 } from "./client";
+import { verifyPlaidWebhook } from "./webhook-verification";
 import type { PlaidCredentials, PlaidTransaction } from "./types";
 import type {
   Connector,
@@ -33,6 +34,8 @@ import type {
   FetchPage,
   ParseWebhookInput,
   ParseWebhookResult,
+  VerifyWebhookInput,
+  VerifyWebhookResult,
 } from "../interface";
 
 const META: ConnectorMeta = {
@@ -208,6 +211,27 @@ export const plaidConnector: Connector<PlaidTransaction> = {
    *   - ITEM / ERROR — handled in the route handler (mark connection
    *     ERROR), not here
    */
+  /**
+   * Verify the JWT in the `Plaid-Verification` header. Delegates to
+   * webhook-verification.ts which:
+   *   - decodes the ES256 JWT
+   *   - fetches the matching JWK from Plaid (in-process cached by kid)
+   *   - confirms iat is within Plaid's 5-min replay window
+   *   - confirms the request body SHA-256 matches the signed claim
+   *
+   * Returns `{ ok: true, kid }` on success or `{ ok: false, reason }` so
+   * the route handler can audit-log specifically why a request was
+   * rejected (stale iat vs bad sig vs body tampered).
+   */
+  verifyWebhookSignature(
+    input: VerifyWebhookInput
+  ): Promise<VerifyWebhookResult> {
+    return verifyPlaidWebhook({
+      rawBody: input.rawBody,
+      headers: input.headers,
+    });
+  },
+
   parseWebhookEvent(
     input: ParseWebhookInput<PlaidTransaction>
   ): Promise<ParseWebhookResult<PlaidTransaction>> {

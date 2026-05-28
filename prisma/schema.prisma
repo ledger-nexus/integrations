@@ -171,6 +171,18 @@ model PlaidWebhookEvent {
   outcome         String   // "SYNC_TRIGGERED" / "ITEM_ERROR_RECORDED" / "IGNORED" / "FAILED"
   outcomeMessage  String?
 
+  /// How the request was authenticated:
+  ///   "JWT"       — Plaid-Verification ES256 JWT verified end-to-end
+  ///   "URL_TOKEN" — legacy URL-token gate matched, JWT not present/verified
+  ///   "DEV_OPEN"  — dev mode, no auth required (NODE_ENV != production)
+  ///                 — never expected to appear in prod audit rows
+  /// Filter on this to audit which webhooks bypassed the strong auth path.
+  verificationMethod  String?
+  /// Key id (`kid`) of the JWK that signed a JWT-verified request. Lets
+  /// operators trace which Plaid signing key was in use during a window
+  /// (useful when Plaid announces key rotations).
+  verificationKid     String?
+
   receivedAt      DateTime @default(now())
 
   @@index([connectionId, receivedAt])

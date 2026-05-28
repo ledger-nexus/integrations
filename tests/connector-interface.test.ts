@@ -56,7 +56,7 @@ describe("plaidConnector: optional methods", () => {
     expect(typeof plaidConnector.parseWebhookEvent).toBe("function");
   });
 
-  it("does NOT YET implement verifyWebhookSignature (URL-token shared secret is the v1 auth; JWT verification ships in a follow-up)", () => {
-    expect(plaidConnector.verifyWebhookSignature).toBeUndefined();
+  it("implements verifyWebhookSignature (ES256 JWT in Plaid-Verification header; v0.2)", () => {
+    expect(typeof plaidConnector.verifyWebhookSignature).toBe("function");
   });
 });

@@ -332,6 +332,11 @@ model Tenant {
   id          String  @id @db.Uuid
   slug        String  @unique
   name        String
+  /// Mirror of ledger-core's Tenant.billingPlan + subscriptionStatus.
+  /// session.requireRepoAccess() reads these to gate by plan.
+  /// integrations is the most-restricted repo — only Scale plan includes it.
+  billingPlan        String?
+  subscriptionStatus String?
   memberships TenantMembership[]
 
   @@map("tenant")

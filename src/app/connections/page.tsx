@@ -37,6 +37,9 @@ export default async function ConnectionsListPage() {
       targetType: true,
       lastSyncedAt: true,
       lastSyncStatus: true,
+      scheduleEnabled: true,
+      syncIntervalMinutes: true,
+      nextSyncAt: true,
       createdAt: true,
       _count: { select: { syncRuns: true } },
     },
@@ -74,6 +77,7 @@ export default async function ConnectionsListPage() {
                   <TH>System</TH>
                   <TH>Target</TH>
                   <TH>Last sync</TH>
+                  <TH>Schedule</TH>
                   <TH className="text-right">Runs</TH>
                   <TH>Status</TH>
                   <TH>Action</TH>
@@ -98,6 +102,20 @@ export default async function ConnectionsListPage() {
                     <TD className="text-xs font-mono text-ink-600">{c.targetType}</TD>
                     <TD className="text-xs text-ink-500">
                       {formatRelativeTime(c.lastSyncedAt)}
+                    </TD>
+                    <TD className="text-xs">
+                      {c.scheduleEnabled && c.syncIntervalMinutes != null ? (
+                        <div className="flex flex-col gap-0.5">
+                          <Badge tone="positive">every {c.syncIntervalMinutes}m</Badge>
+                          {c.nextSyncAt ? (
+                            <span className="text-[10px] text-ink-500">
+                              next {formatRelativeTime(c.nextSyncAt)}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <span className="text-ink-400">off</span>
+                      )}
                     </TD>
                     <TD className="text-right text-xs text-ink-600">
                       {c._count.syncRuns}

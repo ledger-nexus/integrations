@@ -11,6 +11,8 @@ import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatDate, formatMoney, formatRelativeTime } from "@/lib/utils/format";
 import { TriggerSyncButton } from "../trigger-sync-button";
+import { ScheduleControls } from "./schedule-controls";
+import { describeNextRun } from "@/lib/sync/scheduler";
 import { getCurrentTenant } from "@/lib/auth/session";
 
 export default async function ConnectionDetailPage({
@@ -38,6 +40,10 @@ export default async function ConnectionDetailPage({
       lastCursor: true,
       lastSyncedAt: true,
       lastSyncStatus: true,
+      scheduleEnabled: true,
+      syncIntervalMinutes: true,
+      nextSyncAt: true,
+      lastScheduledRunAt: true,
       createdAt: true,
       credentialsJson: true,
       syncRuns: {
@@ -172,6 +178,34 @@ export default async function ConnectionDetailPage({
           </CardContent>
         </Card>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Auto-sync schedule</CardTitle>
+          <span className="text-xs text-ink-500">
+            When enabled, the Vercel Cron tick (every 5 min) picks this
+            connection up at its configured interval and runs a sync via
+            the standard runner. Webhook-triggered syncs and manual "Sync
+            now" still work alongside.
+          </span>
+        </CardHeader>
+        <CardContent>
+          <ScheduleControls
+            connectionId={connection.id}
+            scheduleEnabled={connection.scheduleEnabled}
+            syncIntervalMinutes={connection.syncIntervalMinutes}
+            nextSyncAt={connection.nextSyncAt?.toISOString() ?? null}
+            lastScheduledRunAt={connection.lastScheduledRunAt?.toISOString() ?? null}
+            nextRunDescription={describeNextRun({
+              scheduleEnabled: connection.scheduleEnabled,
+              syncIntervalMinutes: connection.syncIntervalMinutes,
+              nextSyncAt: connection.nextSyncAt,
+              status: connection.status,
+              lastSyncStatus: connection.lastSyncStatus,
+            })}
+          />
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

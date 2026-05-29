@@ -13,6 +13,7 @@ import { formatDate, formatMoney, formatRelativeTime } from "@/lib/utils/format"
 import { TriggerSyncButton } from "../trigger-sync-button";
 import { ScheduleControls } from "./schedule-controls";
 import { describeNextRun } from "@/lib/sync/scheduler";
+import { describeBackoffState } from "@/lib/sync/backoff";
 import { getCurrentTenant } from "@/lib/auth/session";
 
 export default async function ConnectionDetailPage({
@@ -44,6 +45,7 @@ export default async function ConnectionDetailPage({
       syncIntervalMinutes: true,
       nextSyncAt: true,
       lastScheduledRunAt: true,
+      consecutiveFailureCount: true,
       createdAt: true,
       credentialsJson: true,
       syncRuns: {
@@ -202,6 +204,11 @@ export default async function ConnectionDetailPage({
               nextSyncAt: connection.nextSyncAt,
               status: connection.status,
               lastSyncStatus: connection.lastSyncStatus,
+            })}
+            consecutiveFailureCount={connection.consecutiveFailureCount}
+            backoffDescription={describeBackoffState({
+              baseIntervalMinutes: connection.syncIntervalMinutes ?? 60,
+              consecutiveFailureCount: connection.consecutiveFailureCount,
             })}
           />
         </CardContent>

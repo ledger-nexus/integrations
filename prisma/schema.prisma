@@ -79,10 +79,16 @@ model Connection {
   //   skip-locked or skip-status). Different from lastSyncedAt
   //   (which only updates on actual sync attempts) so the operator
   //   can debug "the cron fired but never picked this up".
-  scheduleEnabled     Boolean   @default(false)
-  syncIntervalMinutes Int?
-  nextSyncAt          DateTime?
-  lastScheduledRunAt  DateTime?
+  // consecutiveFailureCount: rolling count of failures since the last
+  //   SUCCESS. The cron handler increments on every FAILURE/ERROR and
+  //   resets to 0 on SUCCESS. Drives exponential backoff in the
+  //   advance-next-sync-at math — a dead bank connection backs off
+  //   instead of flooding the cron tick every 5 min.
+  scheduleEnabled         Boolean   @default(false)
+  syncIntervalMinutes     Int?
+  nextSyncAt              DateTime?
+  lastScheduledRunAt      DateTime?
+  consecutiveFailureCount Int       @default(0)
 
   // Connection metadata. createdBy is the actor (User UUID or "system").
   createdBy     String?

@@ -19,6 +19,7 @@ import { useState, useTransition } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { setConnectionScheduleAction } from "@/app/actions/set-connection-schedule";
+import { resetFailureCountAction } from "@/app/actions/reset-failure-count";
 import {
   SCHEDULER_PRESETS,
   SCHEDULER_MIN_INTERVAL_MINUTES,
@@ -32,6 +33,9 @@ interface Props {
   nextSyncAt: string | null; // ISO; null = no schedule
   lastScheduledRunAt: string | null;
   nextRunDescription: string;
+  consecutiveFailureCount: number;
+  /** Pre-computed via describeBackoffState on the server. */
+  backoffDescription: string;
 }
 
 export function ScheduleControls({
@@ -41,6 +45,8 @@ export function ScheduleControls({
   nextSyncAt,
   lastScheduledRunAt,
   nextRunDescription,
+  consecutiveFailureCount,
+  backoffDescription,
 }: Props) {
   const [pending, startTransition] = useTransition();
   const [editing, setEditing] = useState(false);
@@ -76,6 +82,14 @@ export function ScheduleControls({
     });
   }
 
+  function onResetFailures() {
+    setError(null);
+    startTransition(async () => {
+      const result = await resetFailureCountAction(connectionId);
+      if (!result.ok) setError(result.message);
+    });
+  }
+
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-3">
@@ -105,6 +119,20 @@ export function ScheduleControls({
           {lastScheduledRunAt ? (
             <div className="text-[11px] text-ink-400">
               Cron last looked here at {formatIso(lastScheduledRunAt)}
+            </div>
+          ) : null}
+          {consecutiveFailureCount > 0 ? (
+            <div className="mt-1 flex items-center gap-2">
+              <Badge tone="warning">BACKOFF</Badge>
+              <span className="text-[11px] text-ink-600">{backoffDescription}</span>
+              <button
+                type="button"
+                onClick={onResetFailures}
+                disabled={pending}
+                className="text-[11px] text-accent-600 underline-offset-2 hover:underline disabled:opacity-50"
+              >
+                {pending ? "Resetting…" : "Reset & retry now"}
+              </button>
             </div>
           ) : null}
         </div>

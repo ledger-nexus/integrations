@@ -40,6 +40,7 @@ export default async function ConnectionsListPage() {
       scheduleEnabled: true,
       syncIntervalMinutes: true,
       nextSyncAt: true,
+      consecutiveFailureCount: true,
       createdAt: true,
       _count: { select: { syncRuns: true } },
     },
@@ -106,7 +107,19 @@ export default async function ConnectionsListPage() {
                     <TD className="text-xs">
                       {c.scheduleEnabled && c.syncIntervalMinutes != null ? (
                         <div className="flex flex-col gap-0.5">
-                          <Badge tone="positive">every {c.syncIntervalMinutes}m</Badge>
+                          <div className="flex items-center gap-1">
+                            <Badge tone={c.consecutiveFailureCount > 0 ? "warning" : "positive"}>
+                              every {c.syncIntervalMinutes}m
+                            </Badge>
+                            {c.consecutiveFailureCount > 0 ? (
+                              <span
+                                title={`${c.consecutiveFailureCount} consecutive failure(s) — interval backed off`}
+                                className="text-[10px] font-mono text-amber-700"
+                              >
+                                ×{c.consecutiveFailureCount}
+                              </span>
+                            ) : null}
+                          </div>
                           {c.nextSyncAt ? (
                             <span className="text-[10px] text-ink-500">
                               next {formatRelativeTime(c.nextSyncAt)}

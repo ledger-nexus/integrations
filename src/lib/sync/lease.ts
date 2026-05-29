@@ -117,22 +117,35 @@ export async function claimDueConnections(input: {
  * was skipped — the schedule should keep moving regardless. (Stuck
  * sync states surface via `lastSyncStatus = FAILURE` on the row.)
  *
- * The next time is computed from NOW + interval, NOT from the prior
- * `nextSyncAt + interval`. This means a backlog of missed ticks
- * doesn't trigger a flood of catch-up syncs — we sync at most once
- * per interval going forward, regardless of how far behind we got.
+ * The next time is computed from NOW + effective interval, NOT from
+ * the prior `nextSyncAt + interval`. This means a backlog of missed
+ * ticks doesn't trigger a flood of catch-up syncs — we sync at most
+ * once per interval going forward.
+ *
+ * The effective interval is the base interval scaled by the backoff
+ * math (see ./backoff.ts) — exponential growth from consecutive
+ * failures, capped at 24h. Calling code passes the
+ * `effectiveIntervalMinutes` it computed; we don't recompute here so
+ * the cron's failure-counter update and this advance happen in a
+ * consistent snapshot.
  */
 export async function advanceNextSyncAt(input: {
   connectionId: string;
-  intervalMinutes: number;
+  /** Base interval × backoff multiplier. Caller computes; we apply. */
+  effectiveIntervalMinutes: number;
+  /** Updated failure count to persist alongside the schedule advance. */
+  consecutiveFailureCount: number;
   nowMs?: number;
 }): Promise<void> {
   const now = new Date(input.nowMs ?? Date.now());
-  const next = new Date(now.getTime() + input.intervalMinutes * 60_000);
+  const next = new Date(now.getTime() + input.effectiveIntervalMinutes * 60_000);
   // Truncate to minute boundary — matches the scheduler module.
   next.setSeconds(0, 0);
   await prisma.connection.update({
     where: { id: input.connectionId },
-    data: { nextSyncAt: next },
+    data: {
+      nextSyncAt: next,
+      consecutiveFailureCount: input.consecutiveFailureCount,
+    },
   });
 }

@@ -37,6 +37,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { timingSafeEqual } from "node:crypto";
 import { claimDueConnections, advanceNextSyncAt } from "@/lib/sync/lease";
 import { runConnectionSync } from "@/lib/sync/runner";
+import {
+  computeBackoffMinutes,
+  nextFailureCount,
+  type AttemptOutcome,
+} from "@/lib/sync/backoff";
 import { prisma } from "@/lib/db";
 
 export const runtime = "nodejs";
@@ -111,13 +116,13 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
   let skipped = 0;
 
   for (const claim of claims) {
-    // The runner needs to know the interval to advance nextSyncAt
-    // after. We re-read because the lease only returned a few fields
-    // for footprint; the row was already in the working set, so this
-    // is a cheap cache hit.
+    // The runner needs the base interval + current failure count to
+    // advance nextSyncAt with backoff. We re-read because the lease
+    // only returned a few fields for footprint; the row was already
+    // in the working set, so this is a cheap cache hit.
     const conn = await prisma.connection.findUnique({
       where: { id: claim.connectionId },
-      select: { syncIntervalMinutes: true },
+      select: { syncIntervalMinutes: true, consecutiveFailureCount: true },
     });
     if (!conn || conn.syncIntervalMinutes == null) {
       skipped += 1;
@@ -129,6 +134,10 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       continue;
     }
 
+    // Run the sync; collapse the runner's status into the backoff
+    // module's AttemptOutcome so the failure-counter math is one
+    // consistent vocabulary.
+    let outcome: AttemptOutcome;
     try {
       const result = await runConnectionSync({
         connectionId: claim.connectionId,
@@ -136,6 +145,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       });
       if (result.status === "SKIPPED_LOCKED") {
         skipped += 1;
+        outcome = "SKIPPED";
         details.push({
           connectionId: claim.connectionId,
           systemCode: claim.systemCode,
@@ -144,6 +154,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         });
       } else if (result.status === "FAILURE") {
         syncFailed += 1;
+        outcome = "FAILURE";
         details.push({
           connectionId: claim.connectionId,
           systemCode: claim.systemCode,
@@ -151,8 +162,20 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
           syncRunId: result.syncRunId,
           error: result.error,
         });
+      } else if (result.status === "PARTIAL_SUCCESS") {
+        syncOk += 1;
+        outcome = "PARTIAL_SUCCESS";
+        details.push({
+          connectionId: claim.connectionId,
+          systemCode: claim.systemCode,
+          outcome: "SYNC_OK",
+          syncRunId: result.syncRunId,
+          recordsAdded: result.recordsAdded,
+          recordsPromoted: result.recordsPromoted,
+        });
       } else {
         syncOk += 1;
+        outcome = "SUCCESS";
         details.push({
           connectionId: claim.connectionId,
           systemCode: claim.systemCode,
@@ -168,6 +191,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       // still want to advance the schedule so we don't pile up on
       // the same bad connection every tick.
       syncFailed += 1;
+      outcome = "ERROR";
       details.push({
         connectionId: claim.connectionId,
         systemCode: claim.systemCode,
@@ -176,13 +200,23 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       });
     }
 
-    // Advance the schedule no matter what — even on FAILURE/ERROR.
-    // The connection's lastSyncStatus carries the bad-state signal;
-    // we don't want to stop trying.
+    // Update failure counter + advance the schedule no matter what —
+    // even on FAILURE/ERROR. The connection's lastSyncStatus carries
+    // the bad-state signal; the consecutiveFailureCount drives the
+    // backoff. We never stop trying, just space attempts further out.
     try {
+      const newFailureCount = nextFailureCount({
+        currentCount: conn.consecutiveFailureCount,
+        outcome,
+      });
+      const effectiveInterval = computeBackoffMinutes({
+        baseIntervalMinutes: conn.syncIntervalMinutes,
+        consecutiveFailureCount: newFailureCount,
+      });
       await advanceNextSyncAt({
         connectionId: claim.connectionId,
-        intervalMinutes: conn.syncIntervalMinutes,
+        effectiveIntervalMinutes: effectiveInterval,
+        consecutiveFailureCount: newFailureCount,
       });
     } catch (e) {
       console.error(

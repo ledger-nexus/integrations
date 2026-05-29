@@ -41,8 +41,23 @@ export interface RunSyncResult {
   syncRunId: string;
   status: "SUCCESS" | "PARTIAL_SUCCESS" | "FAILURE" | "SKIPPED_LOCKED";
   recordsAdded: number;
+  /** Upstream-corrected transactions this sync surfaced. */
+  recordsModified: number;
+  /** Upstream-cancelled transactions this sync surfaced. */
+  recordsRemoved: number;
   recordsPromoted: number;
   bankStatementId?: string;
+  /**
+   * Lines on which recon found an APPROVED reconciliation match
+   * after this sync flipped them to VOID. The operator may need
+   * to reverse the corresponding JE in ledger-core; recon doesn't
+   * auto-reverse.
+   */
+  approvedMatchesAffected?: Array<{
+    externalId: string;
+    bankLineId: string;
+    matchId: string;
+  }>;
   error?: string;
 }
 
@@ -86,6 +101,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
         syncRunId: "<missing>",
         status: "FAILURE",
         recordsAdded: 0,
+        recordsModified: 0,
+        recordsRemoved: 0,
         recordsPromoted: 0,
         error: "Connection not found",
       };
@@ -95,6 +112,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
         syncRunId: "<skipped>",
         status: "FAILURE",
         recordsAdded: 0,
+        recordsModified: 0,
+        recordsRemoved: 0,
         recordsPromoted: 0,
         error: `Connection status=${conn.status} — sync skipped`,
       };
@@ -105,6 +124,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
       syncRunId: "<locked>",
       status: "SKIPPED_LOCKED",
       recordsAdded: 0,
+      recordsModified: 0,
+      recordsRemoved: 0,
       recordsPromoted: 0,
       error: "Another sync is already in progress for this connection",
     };
@@ -136,6 +157,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
       syncRunId: "<missing>",
       status: "FAILURE",
       recordsAdded: 0,
+      recordsModified: 0,
+      recordsRemoved: 0,
       recordsPromoted: 0,
       error: "Connection vanished after claim",
     };
@@ -150,6 +173,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
       syncRunId: "<no-target>",
       status: "FAILURE",
       recordsAdded: 0,
+      recordsModified: 0,
+      recordsRemoved: 0,
       recordsPromoted: 0,
       error: "Connection has no BANK_ACCOUNT target — v0.1 only supports bank syncs",
     };
@@ -167,6 +192,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
       syncRunId: "<unknown-connector>",
       status: "FAILURE",
       recordsAdded: 0,
+      recordsModified: 0,
+      recordsRemoved: 0,
       recordsPromoted: 0,
       error: `No connector registered for systemCode="${connection.systemCode}"`,
     };
@@ -336,13 +363,24 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
       syncRunId: syncRun.id,
       status: "SUCCESS",
       recordsAdded,
+      recordsModified,
+      recordsRemoved,
       recordsPromoted: promotion.lineCount,
+      approvedMatchesAffected: promotion.approvedMatchesAffected,
       bankStatementId:
         promotion.bankStatementId.startsWith("<") ? undefined : promotion.bankStatementId,
     };
   } catch (e) {
     // 8. Close out: failure. Cursor NOT advanced — the next sync starts
     // from the same place and re-tries.
+    //
+    // Self-audit fix: persist recordsModified/Removed alongside
+    // recordsAdded on FAILURE. Pre-fix the FAILURE update only wrote
+    // status/errorCode/errorMessage; counter accumulators were
+    // discarded even though their staging rows had been persisted.
+    // The SyncRun row would report 0 modified/removed even when
+    // staging had non-zero counts — operator confusion when
+    // reviewing partial progress.
     const errorMessage = e instanceof Error ? e.message : "Unknown error";
     await prisma.syncRun.update({
       where: { id: syncRun.id },
@@ -351,6 +389,9 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
         status: "FAILURE",
         errorCode: "SYNC_FAILED",
         errorMessage: errorMessage.slice(0, 1000),
+        recordsAdded,
+        recordsModified,
+        recordsRemoved,
       },
     });
     await prisma.connection.update({
@@ -361,6 +402,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
       syncRunId: syncRun.id,
       status: "FAILURE",
       recordsAdded,
+      recordsModified,
+      recordsRemoved,
       recordsPromoted: 0,
       error: errorMessage,
     };

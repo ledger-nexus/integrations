@@ -20,12 +20,14 @@ import type { MappedBankLine } from "../src/lib/connectors/plaid/mapper";
 function makeLine(over: Partial<MappedBankLine> = {}): MappedBankLine {
   return {
     externalId: over.externalId ?? "plaid-tx-1",
+    externalAccountId: over.externalAccountId ?? "plaid-acct-1",
     transactionDate: over.transactionDate ?? new Date("2026-05-15"),
     description: over.description ?? "TEST MERCHANT",
     amount: over.amount ?? new Decimal("25.00"),
     pending: over.pending ?? false,
     currencyCode: over.currencyCode ?? "USD",
-    mapperVersion: over.mapperVersion ?? "plaid/v1",
+    merchantName: over.merchantName ?? null,
+    category: over.category ?? null,
   };
 }
 

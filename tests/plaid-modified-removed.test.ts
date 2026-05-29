@@ -25,8 +25,6 @@ function makeTransaction(
   over: Partial<PlaidTransaction> & { transaction_id: string; account_id: string }
 ): PlaidTransaction {
   return {
-    transaction_id: over.transaction_id,
-    account_id: over.account_id,
     amount: 25.0,
     iso_currency_code: "USD",
     unofficial_currency_code: null,

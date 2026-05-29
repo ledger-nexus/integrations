@@ -127,7 +127,22 @@ export default async function ConnectionsListPage() {
                           ) : null}
                         </div>
                       ) : (
-                        <span className="text-ink-400">off</span>
+                        // Schedule paused — but preserve the failure
+                        // signal if the operator paused mid-failure.
+                        // Without this, unpausing later silently
+                        // triggers an immediate backed-off interval,
+                        // which is surprising.
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-ink-400">off</span>
+                          {c.consecutiveFailureCount > 0 ? (
+                            <span
+                              title={`Paused while ${c.consecutiveFailureCount} consecutive failure(s) were pending. Unpausing without resetting the counter will start with a backed-off interval.`}
+                              className="text-[10px] font-mono text-amber-700"
+                            >
+                              ×{c.consecutiveFailureCount} pending
+                            </span>
+                          ) : null}
+                        </div>
                       )}
                     </TD>
                     <TD className="text-right text-xs text-ink-600">

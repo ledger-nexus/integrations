@@ -28,6 +28,18 @@ export interface PromoteToBankStatementInput {
   bankAccountId: string;
   /** Mapped lines from the sync run, in transaction-date order. */
   lines: MappedBankLine[];
+  /**
+   * MODIFIED lines (v1.2) — upstream corrections. Same shape as
+   * `lines`; recon updates by externalRef in place. Empty when the
+   * connector saw no corrections this sync.
+   */
+  modifiedLines?: MappedBankLine[];
+  /**
+   * REMOVED externalIds (v1.2) — upstream cancellations. Recon flips
+   * matching lines to VOID. Empty when the connector saw no
+   * cancellations this sync.
+   */
+  removedExternalIds?: string[];
   /** SyncRun.id — embedded into filename / rawPayload for audit. */
   syncRunId: string;
   /** Free-form attribution; for now "plaid-sync" — UI / dashboards use this. */
@@ -37,6 +49,20 @@ export interface PromoteToBankStatementInput {
 export interface PromoteResult {
   bankStatementId: string;
   lineCount: number;
+  /** v1.2 — count of upstream corrections applied. */
+  linesModified: number;
+  /** v1.2 — count of upstream cancellations applied. */
+  linesRemoved: number;
+  /**
+   * v1.2 — APPROVED matches on voided lines. Recon does not
+   * auto-withdraw these (the JE may already be posted). The
+   * operator needs to decide whether to reverse via ledger-core.
+   */
+  approvedMatchesAffected: Array<{
+    externalId: string;
+    bankLineId: string;
+    matchId: string;
+  }>;
 }
 
 export type ReconErrorCode =
@@ -70,8 +96,24 @@ export function setFetchForTesting(fn: typeof fetch | null): void {
 export async function promoteToBankStatement(
   input: PromoteToBankStatementInput
 ): Promise<PromoteResult> {
-  if (input.lines.length === 0) {
-    return { bankStatementId: "<empty>", lineCount: 0 };
+  const modifiedLines = input.modifiedLines ?? [];
+  const removedExternalIds = input.removedExternalIds ?? [];
+  // Short-circuit only when there's NO work at all (no added, no
+  // modified, no removed). Modify/remove-only sync runs are valid:
+  // the operator might re-sync after a webhook fired about a
+  // correction.
+  if (
+    input.lines.length === 0 &&
+    modifiedLines.length === 0 &&
+    removedExternalIds.length === 0
+  ) {
+    return {
+      bankStatementId: "<empty>",
+      lineCount: 0,
+      linesModified: 0,
+      linesRemoved: 0,
+      approvedMatchesAffected: [],
+    };
   }
 
   const baseUrl = process.env.RECON_URL ?? DEFAULT_RECON_URL;
@@ -83,19 +125,29 @@ export async function promoteToBankStatement(
     );
   }
 
-  const body = {
-    bankAccountId: input.bankAccountId,
-    syncRunId: input.syncRunId,
-    format: "PLAID_SYNC_V1",
-    uploadedBy: input.uploadedBy ?? "plaid-sync",
-    lines: input.lines.map((l) => ({
+  function lineToWire(l: MappedBankLine) {
+    return {
       externalId: l.externalId,
       transactionDate: l.transactionDate.toISOString().slice(0, 10),
       description: l.description,
       amount: l.amount.toString(),
       pending: l.pending,
-    })),
+    };
+  }
+
+  const body: Record<string, unknown> = {
+    bankAccountId: input.bankAccountId,
+    syncRunId: input.syncRunId,
+    format: "PLAID_SYNC_V1",
+    uploadedBy: input.uploadedBy ?? "plaid-sync",
+    lines: input.lines.map(lineToWire),
   };
+  if (modifiedLines.length > 0) {
+    body.modifiedLines = modifiedLines.map(lineToWire);
+  }
+  if (removedExternalIds.length > 0) {
+    body.removedExternalIds = removedExternalIds;
+  }
 
   const fetchFn = _fetchOverride ?? fetch;
   let res: Response;
@@ -118,6 +170,14 @@ export async function promoteToBankStatement(
         bankStatementId: string | null;
         linesCreated: number;
         linesSkipped: number;
+        linesModified?: number;
+        linesRemoved?: number;
+        matchesWithdrawn?: number;
+        approvedMatchesAffected?: Array<{
+          externalId: string;
+          bankLineId: string;
+          matchId: string;
+        }>;
         wasEmpty: boolean;
       }
     | { ok: false; error: { code: ReconErrorCode; message: string } };
@@ -145,5 +205,8 @@ export async function promoteToBankStatement(
   return {
     bankStatementId: payload.bankStatementId ?? "<empty-after-dedup>",
     lineCount: payload.linesCreated,
+    linesModified: payload.linesModified ?? 0,
+    linesRemoved: payload.linesRemoved ?? 0,
+    approvedMatchesAffected: payload.approvedMatchesAffected ?? [],
   };
 }

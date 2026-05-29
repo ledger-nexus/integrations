@@ -190,6 +190,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
   let recordsRemoved = 0;
   let lastCursor: string | null = connection.lastCursor;
   const allMappedLines: Array<ReturnType<typeof plaidMapperV1.map>> = [];
+  const allModifiedMappedLines: Array<ReturnType<typeof plaidMapperV1.map>> = [];
+  const allRemovedExternalIds: string[] = [];
 
   try {
     for await (const page of connector.fetchSince({
@@ -223,13 +225,11 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
         }
       }
 
-      // Stage MODIFIED records. Same shape as added — the operator
-      // sees them as corrected versions of previously-imported lines.
-      // Downstream propagation to recon (replacing the old amount /
-      // description) lands in a follow-up commit; for now we capture
-      // them in staging + count them on SyncRun so the operator can
-      // see "Plaid corrected 3 of yesterday's transactions" without
-      // logging into Plaid's dashboard.
+      // Stage MODIFIED records + accumulate mapped versions for the
+      // bridge call below. Recon side updates by externalRef in
+      // place (line amount/description/date corrections), preserving
+      // status. Operator re-reviews MATCHED lines whose amounts
+      // changed via the existing UI flow.
       const modifiedRecords = page.modifiedRecords ?? [];
       if (modifiedRecords.length > 0) {
         await prisma.importStagingRecord.createMany({
@@ -243,11 +243,17 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
           skipDuplicates: true,
         });
         recordsModified += modifiedRecords.length;
+        for (const r of modifiedRecords) {
+          const mapped = plaidMapperV1.map(r.raw as PlaidTransaction);
+          allModifiedMappedLines.push(mapped);
+        }
       }
 
-      // Stage REMOVED records. Only the externalId is known; raw +
-      // mapped payloads are null. Downstream consumers (recon's
-      // bridge) match by externalId to find the line to void.
+      // Stage REMOVED records + accumulate external IDs for the
+      // bridge call below. Recon flips matching lines to VOID and
+      // withdraws PROPOSED matches; APPROVED matches surface in the
+      // bridge's response so the operator can decide whether to
+      // reverse the JE manually.
       const removedExternalIds = page.removedExternalIds ?? [];
       if (removedExternalIds.length > 0) {
         await prisma.importStagingRecord.createMany({
@@ -261,6 +267,7 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
           skipDuplicates: true,
         });
         recordsRemoved += removedExternalIds.length;
+        allRemovedExternalIds.push(...removedExternalIds);
       }
 
       lastCursor = page.nextCursor;
@@ -268,12 +275,27 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
     }
 
     // 5. Promote staged records into recon as a BankStatement.
+    // Threads modified + removed through to recon so corrections and
+    // cancellations land alongside the new lines in one call.
     const promotion = await promoteToBankStatement({
       bankAccountId: connection.targetId,
       lines: allMappedLines,
+      modifiedLines: allModifiedMappedLines,
+      removedExternalIds: allRemovedExternalIds,
       syncRunId: syncRun.id,
       uploadedBy: `plaid-sync:${connection.displayName}`,
     });
+
+    // Log approved-match warnings so the operator sees them in Vercel
+    // logs without needing to dig through the SyncRun row. These are
+    // matches where recon left an APPROVED reconciliation in place on
+    // a now-voided bank line — the JE may need manual reversal.
+    if (promotion.approvedMatchesAffected.length > 0) {
+      console.warn(
+        `[plaid-sync] ${connection.displayName}: ${promotion.approvedMatchesAffected.length} approved match(es) on voided lines — may need JE reversal`,
+        promotion.approvedMatchesAffected
+      );
+    }
 
     // 6. Mark staged records as WRITTEN.
     if (recordsAdded > 0) {

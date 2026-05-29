@@ -186,6 +186,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
 
   // 4. Iterate fetchSince pages. Stage every record, advance cursor.
   let recordsAdded = 0;
+  let recordsModified = 0;
+  let recordsRemoved = 0;
   let lastCursor: string | null = connection.lastCursor;
   const allMappedLines: Array<ReturnType<typeof plaidMapperV1.map>> = [];
 
@@ -203,6 +205,7 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
           data: page.records.map((r) => ({
             syncRunId: syncRun.id,
             externalId: r.externalId,
+            recordOp: "ADDED" as const,
             rawPayload: r.raw as object,
             writeStatus: "PENDING",
           })),
@@ -219,6 +222,47 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
           allMappedLines.push(mapped);
         }
       }
+
+      // Stage MODIFIED records. Same shape as added — the operator
+      // sees them as corrected versions of previously-imported lines.
+      // Downstream propagation to recon (replacing the old amount /
+      // description) lands in a follow-up commit; for now we capture
+      // them in staging + count them on SyncRun so the operator can
+      // see "Plaid corrected 3 of yesterday's transactions" without
+      // logging into Plaid's dashboard.
+      const modifiedRecords = page.modifiedRecords ?? [];
+      if (modifiedRecords.length > 0) {
+        await prisma.importStagingRecord.createMany({
+          data: modifiedRecords.map((r) => ({
+            syncRunId: syncRun.id,
+            externalId: r.externalId,
+            recordOp: "MODIFIED" as const,
+            rawPayload: r.raw as object,
+            writeStatus: "PENDING",
+          })),
+          skipDuplicates: true,
+        });
+        recordsModified += modifiedRecords.length;
+      }
+
+      // Stage REMOVED records. Only the externalId is known; raw +
+      // mapped payloads are null. Downstream consumers (recon's
+      // bridge) match by externalId to find the line to void.
+      const removedExternalIds = page.removedExternalIds ?? [];
+      if (removedExternalIds.length > 0) {
+        await prisma.importStagingRecord.createMany({
+          data: removedExternalIds.map((externalId) => ({
+            syncRunId: syncRun.id,
+            externalId,
+            recordOp: "REMOVED" as const,
+            rawPayload: undefined,
+            writeStatus: "PENDING",
+          })),
+          skipDuplicates: true,
+        });
+        recordsRemoved += removedExternalIds.length;
+      }
+
       lastCursor = page.nextCursor;
       if (page.nextCursor === null) break;
     }
@@ -253,6 +297,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
         status: "SUCCESS",
         cursorAfter: lastCursor,
         recordsAdded,
+        recordsModified,
+        recordsRemoved,
       },
     });
     await prisma.connection.update({

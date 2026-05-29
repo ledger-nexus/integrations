@@ -244,12 +244,25 @@ model ImportStagingRecord {
   // re-running a sync should NOT create duplicates.
   externalId String
 
+  /// Operation type signaled by the connector.
+  ///   ADDED — new transaction (default; the v0.1 case)
+  ///   MODIFIED — existing transaction had its amount/description/date
+  ///     corrected by the source system. Plaid signals these on its
+  ///     /transactions/sync response. The mapped payload is the
+  ///     UPDATED shape; downstream consumers replace the prior values.
+  ///   REMOVED — source system says this transaction no longer exists
+  ///     (cancelled/voided). rawPayload + mappedPayload are null;
+  ///     externalId is enough to identify which line to void downstream.
+  recordOp StagingRecordOp @default(ADDED)
+
   // Raw record from the connector (frozen). For Plaid: the full
-  // Transaction object as returned by /transactions/sync.
-  rawPayload Json
+  // Transaction object as returned by /transactions/sync. Null for
+  // REMOVED records (the connector only gives us the externalId).
+  rawPayload Json?
 
   // After mapping. Shape varies by connection.targetType.
-  // For BANK_ACCOUNT: a BankStatementLine-shaped object.
+  // For BANK_ACCOUNT: a BankStatementLine-shaped object. Null for
+  // REMOVED records.
   mappedPayload Json?
 
   // Status of the downstream write.
@@ -263,6 +276,12 @@ model ImportStagingRecord {
   @@unique([syncRunId, externalId])
   @@index([writeStatus, createdAt])
   @@map("import_staging_record")
+}
+
+enum StagingRecordOp {
+  ADDED
+  MODIFIED
+  REMOVED
 }
 
 enum StagingWriteStatus {

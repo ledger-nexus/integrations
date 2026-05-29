@@ -103,10 +103,34 @@ export interface CompleteAuthResult {
  * plus the raw payload (for the staging table's frozen audit trail).
  */
 export interface FetchPage<TRecord> {
+  /** ADDED records — new transactions/rows on this page. */
   records: Array<{
     externalId: string;
     raw: TRecord;
   }>;
+  /**
+   * MODIFIED records — existing transactions the source system has
+   * retroactively corrected (amount fix, description change,
+   * date reclassification). Same shape as `records`; downstream
+   * consumers replace the prior values for the same externalId.
+   *
+   * Optional. Connectors that don't support modifications (or whose
+   * sync APIs don't surface them) omit this field entirely; the
+   * engine treats undefined the same as an empty array.
+   */
+  modifiedRecords?: Array<{
+    externalId: string;
+    raw: TRecord;
+  }>;
+  /**
+   * REMOVED records — source system says these transactions no
+   * longer exist (cancelled, voided, deleted). Only the externalId
+   * is provided; the engine matches against previously-staged
+   * records to find what to void downstream.
+   *
+   * Optional. Same default semantics as `modifiedRecords`.
+   */
+  removedExternalIds?: string[];
   /** Cursor to pass on the next call. null = no more pages. */
   nextCursor: string | null;
 }

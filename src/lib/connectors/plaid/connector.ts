@@ -166,19 +166,32 @@ export const plaidConnector: Connector<PlaidTransaction> = {
         cursor,
       });
 
-      // Build the page. v0.1 ignores `modified` and `removed` — the
-      // matcher in recon can't yet handle retro-updates to imported
-      // transactions. Adding that is a v0.2 enhancement; for now the
-      // engine fast-paths the simpler add-only case. Tracked in
-      // docs/adding-a-connector.md.
+      // Build the page. We emit all three operation types Plaid
+      // signals: added (new), modified (corrections), removed
+      // (cancellations). The engine stages each with a recordOp tag
+      // and the sync runner counts them onto SyncRun.
+      //
+      // Banks correct charge amounts (think gas station authorization
+      // → actual fillup) and cancel transactions (declined post-auth).
+      // Pre-v0.2 we ignored both, so reconciliation diverged silently
+      // from what the bank shows.
+      const accountFilter = (t: { account_id: string }): boolean =>
+        !creds.accountId || t.account_id === creds.accountId;
       const records = response.added
-        // Filter accounts we don't care about (Plaid Items can have
-        // multiple; this Connection targets a specific one).
-        .filter((t) => !creds.accountId || t.account_id === creds.accountId)
+        .filter(accountFilter)
         .map((t) => ({ externalId: t.transaction_id, raw: t }));
+      const modifiedRecords = response.modified
+        .filter(accountFilter)
+        .map((t) => ({ externalId: t.transaction_id, raw: t }));
+      // Plaid's removed records carry only transaction_id (no
+      // account_id), so we can't filter by account. Recon-side
+      // dedup catches any externalIds that never belonged here.
+      const removedExternalIds = response.removed.map((r) => r.transaction_id);
 
       yield {
         records,
+        modifiedRecords,
+        removedExternalIds,
         nextCursor: response.has_more ? response.next_cursor : null,
       };
 

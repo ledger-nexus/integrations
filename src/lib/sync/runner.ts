@@ -7,10 +7,14 @@
 // background job queue (pg_boss) and split it into per-page handlers
 // so a long sync doesn't tie up a Server Action's request thread.
 //
-// Per-connection lock: simple "is the connection already syncing?"
-// guard via the lastSyncStatus column. Two concurrent sync attempts
-// would corrupt the cursor — we refuse the second one and let it
-// retry after the first completes.
+// Per-connection lock: atomic conditional UPDATE on lastSyncStatus.
+// The runner claims the connection by SETing lastSyncStatus='RUNNING'
+// WHERE id=? AND status='ACTIVE' AND (lastSyncStatus IS NULL OR
+// lastSyncStatus != 'RUNNING'). Postgres serializes the update on
+// the row — whichever transaction commits second sees zero rows
+// affected and returns SKIPPED_LOCKED. This guards against the
+// manual-trigger + cron-claim race the simple "read then check then
+// write" pattern was vulnerable to.
 
 import { prisma } from "@/lib/db";
 import { plaidConnector } from "@/lib/connectors/plaid/connector";
@@ -43,7 +47,74 @@ export interface RunSyncResult {
 }
 
 export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncResult> {
-  // 1. Load the connection + check it's actionable.
+  // 1. Atomic claim. Audit-pass deferred fix.
+  //
+  // Pre-fix: the runner did a findUnique → check lastSyncStatus !=
+  // RUNNING → later update lastSyncStatus = RUNNING. That's a TOCTOU
+  // race: two concurrent runners (e.g., manual trigger + cron lease)
+  // could both pass the check between the read and the write, both
+  // create SyncRun rows, and both proceed against the same connection.
+  // The cron lease's SELECT FOR UPDATE SKIP LOCKED prevents two
+  // cron-instances from claiming the same row, but doesn't protect
+  // against a manual sync racing with a cron-claimed sync.
+  //
+  // Fix: atomic UPDATE … WHERE … with row-count check. Postgres
+  // serializes concurrent updates on the row; whichever transaction
+  // commits second sees zero rows affected (its WHERE no longer
+  // matches the now-RUNNING row). The lastSyncStatus column needs an
+  // IS NULL OR != 'RUNNING' check because fresh connections have it
+  // as null. We drop to raw SQL because Prisma's typed { not: ... }
+  // on a nullable enum doesn't include null reliably across versions.
+  const claimedRows = await prisma.$executeRaw`
+    UPDATE connection
+    SET last_sync_status = 'RUNNING'
+    WHERE id = ${input.connectionId}::uuid
+      AND status = 'ACTIVE'
+      AND (last_sync_status IS NULL OR last_sync_status != 'RUNNING')
+  `;
+
+  if (claimedRows === 0) {
+    // Differentiate the cause for the caller. The findUnique is safe
+    // even when locked because we're only reading non-volatile fields
+    // to classify the failure.
+    const conn = await prisma.connection.findUnique({
+      where: { id: input.connectionId },
+      select: { status: true, lastSyncStatus: true },
+    });
+    if (!conn) {
+      return {
+        syncRunId: "<missing>",
+        status: "FAILURE",
+        recordsAdded: 0,
+        recordsPromoted: 0,
+        error: "Connection not found",
+      };
+    }
+    if (conn.status !== "ACTIVE") {
+      return {
+        syncRunId: "<skipped>",
+        status: "FAILURE",
+        recordsAdded: 0,
+        recordsPromoted: 0,
+        error: `Connection status=${conn.status} — sync skipped`,
+      };
+    }
+    // Status is ACTIVE but the claim failed → must be RUNNING (or a
+    // race we didn't catch above). Report as locked.
+    return {
+      syncRunId: "<locked>",
+      status: "SKIPPED_LOCKED",
+      recordsAdded: 0,
+      recordsPromoted: 0,
+      error: "Another sync is already in progress for this connection",
+    };
+  }
+
+  // 2. Claim succeeded. Read the full connection state — now safe
+  // because we hold the RUNNING claim and no other runner can mutate
+  // credentialsJson/lastCursor concurrently (their claim attempt
+  // returns 0 rows). The atomic claim above also already flipped
+  // lastSyncStatus to RUNNING, so the read sees that.
   const connection = await prisma.connection.findUnique({
     where: { id: input.connectionId },
     select: {
@@ -59,33 +130,22 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
     },
   });
   if (!connection) {
+    // Vanishingly rare: row deleted between the claim and the read.
+    // Don't try to release the claim (there's nothing to release).
     return {
       syncRunId: "<missing>",
       status: "FAILURE",
       recordsAdded: 0,
       recordsPromoted: 0,
-      error: "Connection not found",
-    };
-  }
-  if (connection.status !== "ACTIVE") {
-    return {
-      syncRunId: "<skipped>",
-      status: "FAILURE",
-      recordsAdded: 0,
-      recordsPromoted: 0,
-      error: `Connection status=${connection.status} — sync skipped`,
-    };
-  }
-  if (connection.lastSyncStatus === "RUNNING") {
-    return {
-      syncRunId: "<locked>",
-      status: "SKIPPED_LOCKED",
-      recordsAdded: 0,
-      recordsPromoted: 0,
-      error: "Another sync is already in progress for this connection",
+      error: "Connection vanished after claim",
     };
   }
   if (connection.targetType !== "BANK_ACCOUNT" || !connection.targetId) {
+    // Release the claim — the connection isn't actually syncable.
+    await prisma.connection.update({
+      where: { id: connection.id },
+      data: { lastSyncStatus: "FAILURE" },
+    });
     return {
       syncRunId: "<no-target>",
       status: "FAILURE",
@@ -97,6 +157,12 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
 
   const connector = CONNECTOR_REGISTRY[connection.systemCode];
   if (!connector) {
+    // Release the claim — no connector means we can't sync this
+    // (but the row stays around; the operator may register one later).
+    await prisma.connection.update({
+      where: { id: connection.id },
+      data: { lastSyncStatus: "FAILURE" },
+    });
     return {
       syncRunId: "<unknown-connector>",
       status: "FAILURE",
@@ -106,7 +172,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
     };
   }
 
-  // 2. Open a SyncRun + flip status to RUNNING.
+  // 3. Open a SyncRun. (lastSyncStatus is already RUNNING from the
+  // atomic claim above; no second update needed.)
   const syncRun = await prisma.syncRun.create({
     data: {
       connectionId: connection.id,
@@ -116,12 +183,8 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
     },
     select: { id: true },
   });
-  await prisma.connection.update({
-    where: { id: connection.id },
-    data: { lastSyncStatus: "RUNNING" },
-  });
 
-  // 3. Iterate fetchSince pages. Stage every record, advance cursor.
+  // 4. Iterate fetchSince pages. Stage every record, advance cursor.
   let recordsAdded = 0;
   let lastCursor: string | null = connection.lastCursor;
   const allMappedLines: Array<ReturnType<typeof plaidMapperV1.map>> = [];
@@ -160,7 +223,7 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
       if (page.nextCursor === null) break;
     }
 
-    // 4. Promote staged records into recon as a BankStatement.
+    // 5. Promote staged records into recon as a BankStatement.
     const promotion = await promoteToBankStatement({
       bankAccountId: connection.targetId,
       lines: allMappedLines,
@@ -168,7 +231,7 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
       uploadedBy: `plaid-sync:${connection.displayName}`,
     });
 
-    // 5. Mark staged records as WRITTEN.
+    // 6. Mark staged records as WRITTEN.
     if (recordsAdded > 0) {
       await prisma.importStagingRecord.updateMany({
         where: { syncRunId: syncRun.id, writeStatus: "PENDING" },
@@ -182,7 +245,7 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
       });
     }
 
-    // 6. Close out: success.
+    // 7. Close out: success.
     await prisma.syncRun.update({
       where: { id: syncRun.id },
       data: {
@@ -210,7 +273,7 @@ export async function runConnectionSync(input: RunSyncInput): Promise<RunSyncRes
         promotion.bankStatementId.startsWith("<") ? undefined : promotion.bankStatementId,
     };
   } catch (e) {
-    // 7. Close out: failure. Cursor NOT advanced — the next sync starts
+    // 8. Close out: failure. Cursor NOT advanced — the next sync starts
     // from the same place and re-tries.
     const errorMessage = e instanceof Error ? e.message : "Unknown error";
     await prisma.syncRun.update({

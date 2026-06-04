@@ -1,9 +1,12 @@
-// Test for the DSR connections-export stub.
-// See recon/tests/recon-attribution-stub.test.ts for rationale.
+// Contract tests for the DSR connections-export helper.
 //
-// EXTRA INVARIANT for integrations: the interface MUST NOT have a
-// credentials/tokens field. The auditor sees this test as enforcement
-// of the Art. 15(4) rights-of-others carve-out.
+// These tests lock the INTERFACE shape — the "no credentials" invariant
+// is the load-bearing one for the Art. 15(4) rights-of-others carve-
+// out. Runtime-behavior tests (counts vs. real Postgres) live in
+// `connections-export.test.ts`.
+//
+// Before v0.2: function threw NotImplementedError. After v0.2: the
+// function is wired but the contract shape is still enforced here.
 
 import { describe, it, expect } from "vitest";
 import {
@@ -12,38 +15,19 @@ import {
   type ConnectionsAttribution,
 } from "../src/lib/privacy/connections-export";
 
-describe("DSR — integrations connections-export stub (Privacy TSC contract)", () => {
+describe("DSR — integrations connections-export contract (Privacy TSC)", () => {
   it("exports the connectionsAttribution function", () => {
     expect(typeof connectionsAttribution).toBe("function");
   });
 
-  it("exports the NotImplementedError class", () => {
+  it("retains the NotImplementedError class export (back-compat)", () => {
+    // Kept for callers that imported it during the typed-stub era.
     expect(typeof NotImplementedError).toBe("function");
     expect(new NotImplementedError("test").name).toBe("NotImplementedError");
   });
 
-  it("throws NotImplementedError when called (locks the contract)", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const fakePrisma = {} as any;
-    await expect(
-      connectionsAttribution(fakePrisma, "test-user-id")
-    ).rejects.toThrow(NotImplementedError);
-  });
-
-  it("error message points at the DSR doc's Open items section", async () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const fakePrisma = {} as any;
-    try {
-      await connectionsAttribution(fakePrisma, "test-user-id");
-      throw new Error("expected throw");
-    } catch (e) {
-      expect((e as Error).message).toMatch(/data-subject-requests/);
-      expect((e as Error).message).toMatch(/Open items/);
-    }
-  });
-
   it("ConnectionsAttribution interface has no credentials/tokens field (Art. 15(4) carve-out enforcement)", () => {
-    // This is the LOAD-BEARING test for the integrations DSR stub.
+    // This is the LOAD-BEARING test for the integrations DSR helper.
     // If a future contributor adds a tokens/credentials/accessToken
     // field to the interface, this test fails at tsc.
     const shape: ConnectionsAttribution = {

@@ -61,6 +61,14 @@ const PII_FIELD_NAMES = new Set<string>([
   // counterparty names, addresses.
   "rawRecord",
   "rawPayload",
+  // 14th-pass M4 — connector vendor identifier gaps. Exact-string
+  // match means "itemId" matches but "plaidItemId" does not, and
+  // integrations actually uses the vendor-prefixed spelling in
+  // Connection.externalId payloads.
+  "plaidItemId",
+  "stripeCustomerId",
+  "gustoEmployeeId",
+  "linkToken", // Plaid session-creation artifact (distinct from linkSessionId)
   // Bank / financial — same as recon since integrations writes to
   // recon's BankStatementLine via the bridge.
   "accountNumber",
@@ -90,13 +98,21 @@ function redact(value: unknown): unknown {
   if (typeof value !== "object") return value;
   if (Array.isArray(value)) return value.map(redact);
   // Special handling for Error objects — preserve the shape so the
-  // caller can still see .name + .stack, but redact .message (which
-  // often embeds user input).
+  // caller can still see .name + .stack, but redact .message AND
+  // strip the message-preamble from the stack.
+  //
+  // 14th-pass H1 fix: V8 embeds the error's own .message as the
+  // first line of .stack ("Error: token plk-secret\n    at ...").
+  // Without this stripping, redactPii(new Error("plk-secret"))
+  // returns { message: "[REDACTED]", stack: "Error: plk-secret\n..." }
+  // — a clean Confidentiality TSC leak via the stack. For integrations
+  // this is the LOAD-BEARING case (OAuth tokens in error messages
+  // would leak straight to Sentry via stack).
   if (value instanceof Error) {
     return {
       name: value.name,
       message: REDACTED,
-      stack: value.stack,
+      stack: stripStackPreamble(value.stack),
     };
   }
   const out: Record<string, unknown> = {};
@@ -116,3 +132,36 @@ function redact(value: unknown): unknown {
  * convention (TypeScript doesn't enforce, but a code reviewer should).
  */
 export const PII_FIELDS = PII_FIELD_NAMES;
+
+/**
+ * Strip the leading `Error: <message>` line(s) from a V8 stack trace
+ * so the original error message doesn't leak via .stack after .message
+ * has been redacted. Sentry's grouping reads the `Error: ` prefix on
+ * the first line so we preserve that — only the message text changes.
+ *
+ * Returns the stack unchanged if no V8-shaped frames are found.
+ */
+export function stripStackPreamble(stack: string | undefined): string | undefined {
+  if (!stack) return stack;
+  const firstFrameIdx = stack.indexOf("\n    at ");
+  if (firstFrameIdx < 0) return stack;
+  return `Error: [REDACTED]${stack.slice(firstFrameIdx)}`;
+}
+
+/**
+ * Sanitize an unknown error value before handing to Sentry's
+ * `captureException(err, ...)`. Returns a NEW Error with .message
+ * redacted + .stack preamble stripped if the input was an Error.
+ *
+ * Critical-tier importance for integrations: a Plaid error message
+ * `"Sync failed for token plk-secret-abcdef"` would otherwise reach
+ * Sentry's searchable index via err.stack's preamble. This sanitizer
+ * closes that path.
+ */
+export function sanitizeErrorForCapture(err: unknown): unknown {
+  if (!(err instanceof Error)) return err;
+  const cleaned = new Error(REDACTED);
+  cleaned.name = err.name;
+  cleaned.stack = stripStackPreamble(err.stack);
+  return cleaned;
+}

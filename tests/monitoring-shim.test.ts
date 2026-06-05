@@ -6,7 +6,12 @@
 // data-classification.md (OAuth token leak = Critical incident).
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { redactPii, PII_FIELDS } from "../src/lib/soc2/redact-pii";
+import {
+  redactPii,
+  PII_FIELDS,
+  stripStackPreamble,
+  sanitizeErrorForCapture,
+} from "../src/lib/soc2/redact-pii";
 import {
   captureError,
   captureMessage,
@@ -101,7 +106,41 @@ describe("redactPii — PII allowlist", () => {
     expect(PII_FIELDS.has("accessToken")).toBe(true); // Critical
     expect(PII_FIELDS.has("publicToken")).toBe(true);
     expect(PII_FIELDS.has("rawRecord")).toBe(true);
+    // 14th-pass M4: vendor-prefixed identifier gap-fills.
+    expect(PII_FIELDS.has("plaidItemId")).toBe(true);
+    expect(PII_FIELDS.has("stripeCustomerId")).toBe(true);
+    expect(PII_FIELDS.has("gustoEmployeeId")).toBe(true);
+    expect(PII_FIELDS.has("linkToken")).toBe(true);
     expect(PII_FIELDS.has("benign")).toBe(false);
+  });
+
+  it("14th-pass H1: strips OAuth token from Error.stack preamble (Critical)", () => {
+    const err = new Error("Sync failed for token plk-secret-abcdef-12345");
+    const out = redactPii(err);
+    expect(out.stack).not.toContain("plk-secret-abcdef-12345");
+    expect(out.stack).toContain("    at ");
+    expect(out.stack).toContain("[REDACTED]");
+  });
+
+  it("14th-pass H1: stripStackPreamble handles edges", () => {
+    expect(stripStackPreamble(undefined)).toBe(undefined);
+    expect(stripStackPreamble("custom format")).toBe("custom format");
+  });
+
+  it("14th-pass M4: redacts vendor-prefixed identifiers", () => {
+    const obj = {
+      plaidItemId: "item-abc123",
+      stripeCustomerId: "cus_def456",
+      gustoEmployeeId: "emp-ghi789",
+      linkToken: "link-secret-xyz",
+      benign: "value",
+    };
+    const out = redactPii(obj);
+    expect(out.plaidItemId).toBe("[REDACTED]");
+    expect(out.stripeCustomerId).toBe("[REDACTED]");
+    expect(out.gustoEmployeeId).toBe("[REDACTED]");
+    expect(out.linkToken).toBe("[REDACTED]");
+    expect(out.benign).toBe("value");
   });
 });
 
@@ -158,6 +197,37 @@ describe("captureError — Sentry fallback path", () => {
     const serialized = JSON.stringify(args);
     expect(serialized).toContain("errPrimitive");
     expect(serialized).toContain("string-error");
+  });
+
+  it("14th-pass M1: caps err.code at 16 chars", () => {
+    const err = new Error("boom");
+    (err as { code?: string }).code =
+      "ECONNREFUSED: 10.0.1.42:5432 server-side";
+    captureError(err, { context: "test" });
+    const args = consoleErrorSpy.mock.calls[0];
+    const serialized = JSON.stringify(args);
+    expect(serialized).not.toContain("10.0.1.42");
+    expect(serialized).toContain("ECONNREFUSED: 10");
+  });
+});
+
+describe("sanitizeErrorForCapture — Sentry path safety (14th-pass H1)", () => {
+  it("returns non-Errors unchanged", () => {
+    expect(sanitizeErrorForCapture("string-error")).toBe("string-error");
+  });
+
+  it("returns a NEW Error (doesn't mutate the caller's err)", () => {
+    const original = new Error("Failed for token plk-secret");
+    const out = sanitizeErrorForCapture(original);
+    expect(original.message).toBe("Failed for token plk-secret");
+    expect((out as Error).message).toBe("[REDACTED]");
+  });
+
+  it("strips OAuth token from the returned Error's .stack (Critical)", () => {
+    const original = new Error("Failed for token plk-secret-abcdef-12345");
+    const out = sanitizeErrorForCapture(original) as Error;
+    expect(out.stack).not.toContain("plk-secret-abcdef-12345");
+    expect(out.stack).toContain("[REDACTED]");
   });
 });
 

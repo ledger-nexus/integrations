@@ -100,3 +100,25 @@ export interface PlaidAccount {
     iso_currency_code?: string | null;
   };
 }
+
+/**
+ * Plaid's JWK shape as returned by /webhook_verification_key/get.
+ * Plaid signs webhooks with ES256 (ECDSA over P-256 + SHA-256), so the
+ * key is an EC public key with x/y coordinates.
+ *
+ * `expired_at` is a Unix timestamp (seconds). If set and in the past,
+ * Plaid has rotated past this key — but in-flight retries of older
+ * webhooks may still arrive and remain valid for a short window.
+ * Verification logic treats null `expired_at` as "current key".
+ */
+export interface PlaidWebhookVerificationKey {
+  alg: string;        // "ES256"
+  crv: string;        // "P-256"
+  kid: string;
+  kty: string;        // "EC"
+  use: string;        // "sig"
+  x: string;          // base64url-encoded EC x coordinate
+  y: string;          // base64url-encoded EC y coordinate
+  created_at: number; // unix seconds
+  expired_at: number | null;
+}

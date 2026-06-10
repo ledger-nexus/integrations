@@ -23,6 +23,7 @@ import type {
   PlaidTransaction,
   PlaidTransactionsSyncResponse,
   PlaidAccount,
+  PlaidWebhookVerificationKey,
 } from "./types";
 
 let _clientOverride: PlaidApi | null = null;
@@ -165,6 +166,27 @@ export async function getAccounts(accessToken: string): Promise<PlaidAccount[]> 
   const client = getPlaidClient();
   const res = await client.accountsGet({ access_token: accessToken });
   return res.data.accounts as unknown as PlaidAccount[];
+}
+
+/**
+ * Fetch the public JWK Plaid signs a given webhook with. Caller passes
+ * the `kid` extracted from the JWT header in the `Plaid-Verification`
+ * request header.
+ *
+ * Plaid rotates keys periodically. A `kid` we've never seen requires a
+ * fresh call. Old `kid`s remain valid until their `expired_at` passes
+ * (after which Plaid stops signing new webhooks with them — but
+ * in-flight retries of older webhooks may still arrive).
+ *
+ * The verification module caches the JWK in-process; this raw wrapper
+ * is the cache miss path.
+ */
+export async function webhookVerificationKeyGet(
+  keyId: string
+): Promise<PlaidWebhookVerificationKey> {
+  const client = getPlaidClient();
+  const res = await client.webhookVerificationKeyGet({ key_id: keyId });
+  return res.data.key as unknown as PlaidWebhookVerificationKey;
 }
 
 /**

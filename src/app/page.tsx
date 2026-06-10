@@ -7,10 +7,39 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatRelativeTime } from "@/lib/utils/format";
+import { getCurrentTenant } from "@/lib/auth/session";
+import { getRepoAccess } from "@/lib/auth/repo-access";
 
 export default async function DashboardPage() {
+  // SECURITY (pen-test pass 4 follow-up): tenant-scope the dashboard.
+  // Connection has no tenantId column; walk Connection.targetId →
+  // BankAccount.entity.tenantId. SyncRun filters by connectionId in
+  // that scope.
+  const tenant = await getCurrentTenant();
+  // Plan gate: integrations is Scale-only. Banner when not included.
+  const access = tenant ? getRepoAccess(tenant) : null;
+  const tenantBankAccountIds = tenant
+    ? (
+        await prisma.bankAccount.findMany({
+          where: { entity: { tenantId: tenant.id } },
+          select: { id: true },
+        })
+      ).map((b) => b.id)
+    : [];
+  const connectionWhere = tenant
+    ? { targetType: "BANK_ACCOUNT" as const, targetId: { in: tenantBankAccountIds } }
+    : { id: "__none__" };
+  const tenantConnectionIds = tenant
+    ? (
+        await prisma.connection.findMany({
+          where: connectionWhere,
+          select: { id: true },
+        })
+      ).map((c) => c.id)
+    : [];
   const [connections, recentRuns] = await Promise.all([
     prisma.connection.findMany({
+      where: connectionWhere,
       orderBy: [{ status: "asc" }, { lastSyncedAt: "desc" }],
       take: 20,
       select: {
@@ -23,6 +52,9 @@ export default async function DashboardPage() {
       },
     }),
     prisma.syncRun.findMany({
+      where: tenant
+        ? { connectionId: { in: tenantConnectionIds } }
+        : { id: "__none__" },
       orderBy: { startedAt: "desc" },
       take: 10,
       select: {
@@ -47,6 +79,20 @@ export default async function DashboardPage() {
 
   return (
     <div className="flex flex-col gap-6">
+      {access && !access.included && (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3">
+          <div className="text-sm font-medium text-amber-900">
+            integrations is not included in your &quot;{access.currentPlan}&quot; plan
+          </div>
+          <p className="mt-1 text-xs text-amber-700">
+            Third-party data connectors (Plaid bank feed, plus Stripe /
+            Gusto / Bill.com in future) are part of the Scale tier.
+            Existing connection metadata stays visible, but new syncs
+            are refused (or warned in dev). Upgrade at{" "}
+            <code className="font-mono">/admin/billing</code> in ledger-core.
+          </p>
+        </div>
+      )}
       <header>
         <h1 className="text-xl font-semibold text-ink-900">Integrations</h1>
         <p className="text-sm text-ink-500">

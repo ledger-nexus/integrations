@@ -11,12 +11,24 @@ import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatDate, formatMoney, formatRelativeTime } from "@/lib/utils/format";
 import { TriggerSyncButton } from "../trigger-sync-button";
+import { ScheduleControls } from "./schedule-controls";
+import { describeNextRun } from "@/lib/sync/scheduler";
+import { describeBackoffState } from "@/lib/sync/backoff";
+import { getCurrentTenant } from "@/lib/auth/session";
 
 export default async function ConnectionDetailPage({
   params,
 }: {
   params: { id: string };
 }) {
+  // SECURITY (pen-test pass 4 follow-up): tenant-scope the read.
+  // Without this, a signed-in user could navigate to /connections/[any-id]
+  // and read the institution name, masked external account, full sync
+  // history, and imported statement metadata of another tenant's bank
+  // connection. The masked accountId helps but is not protection — the
+  // displayName already includes the bank + last4.
+  const tenant = await getCurrentTenant();
+  if (!tenant) notFound();
   const connection = await prisma.connection.findUnique({
     where: { id: params.id },
     select: {
@@ -29,6 +41,11 @@ export default async function ConnectionDetailPage({
       lastCursor: true,
       lastSyncedAt: true,
       lastSyncStatus: true,
+      scheduleEnabled: true,
+      syncIntervalMinutes: true,
+      nextSyncAt: true,
+      lastScheduledRunAt: true,
+      consecutiveFailureCount: true,
       createdAt: true,
       credentialsJson: true,
       syncRuns: {
@@ -47,6 +64,21 @@ export default async function ConnectionDetailPage({
     },
   });
   if (!connection) notFound();
+
+  // Tenant check via the same chain triggerSyncAction uses:
+  // Connection.targetId → BankAccount → entity.tenantId. Connection
+  // has no tenantId column itself, so this is the canonical join.
+  if (connection.targetType === "BANK_ACCOUNT" && connection.targetId) {
+    const bankAccount = await prisma.bankAccount.findFirst({
+      where: { id: connection.targetId, entity: { tenantId: tenant.id } },
+      select: { id: true },
+    });
+    if (!bankAccount) notFound();
+  } else {
+    // Unknown targetType — no tenant-resolution path yet. Refuse rather
+    // than leak. (v0.2 PARTY / GL_ACCOUNT targets will add branches.)
+    notFound();
+  }
 
   // Pull a few of the most recent BankStatement entries imported from this connection.
   // Filter via filename pattern (plaid-sync-<runId>.json — see recon-bridge.ts).
@@ -148,6 +180,39 @@ export default async function ConnectionDetailPage({
           </CardContent>
         </Card>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>Auto-sync schedule</CardTitle>
+          <span className="text-xs text-ink-500">
+            When enabled, the Vercel Cron tick (every 5 min) picks this
+            connection up at its configured interval and runs a sync via
+            the standard runner. Webhook-triggered syncs and manual "Sync
+            now" still work alongside.
+          </span>
+        </CardHeader>
+        <CardContent>
+          <ScheduleControls
+            connectionId={connection.id}
+            scheduleEnabled={connection.scheduleEnabled}
+            syncIntervalMinutes={connection.syncIntervalMinutes}
+            nextSyncAt={connection.nextSyncAt?.toISOString() ?? null}
+            lastScheduledRunAt={connection.lastScheduledRunAt?.toISOString() ?? null}
+            nextRunDescription={describeNextRun({
+              scheduleEnabled: connection.scheduleEnabled,
+              syncIntervalMinutes: connection.syncIntervalMinutes,
+              nextSyncAt: connection.nextSyncAt,
+              status: connection.status,
+              lastSyncStatus: connection.lastSyncStatus,
+            })}
+            consecutiveFailureCount={connection.consecutiveFailureCount}
+            backoffDescription={describeBackoffState({
+              baseIntervalMinutes: connection.syncIntervalMinutes ?? 60,
+              consecutiveFailureCount: connection.consecutiveFailureCount,
+            })}
+          />
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader>

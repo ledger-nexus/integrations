@@ -1,8 +1,20 @@
 # CI for integrations.
 #
-# tsc + unit tests on every PR / push to main. Tests here are pure-
-# function (Plaid mapper, connector-interface conformance) — no DB
-# required, no Plaid API hit.
+# Two jobs:
+#
+#   test  — tsc + unit tests on every PR / push to main. Tests here
+#           are pure-function (Plaid mapper, connector-interface
+#           conformance, recon-bridge with mocked fetch, JWT webhook
+#           verification, scheduler + backoff math) — no DB required,
+#           no Plaid API hit.
+#
+#   smoke — runs scripts/smoke-test-plaid.ts against Plaid Sandbox.
+#           Exercises the connector end-to-end: create Item, exchange
+#           token, call /transactions/sync, verify added / modified /
+#           removed pass through FetchPage correctly. Plaid Sandbox
+#           is FREE — no token cost — but kept on workflow_dispatch
+#           to keep CI runs predictable and not depend on Plaid's
+#           sandbox uptime.
 #
 # Production deployment is via Vercel's GitHub integration. See
 # ledger-core/docs/DEPLOY.md.
@@ -32,3 +44,31 @@ jobs:
         run: npx tsc --noEmit
       - name: Unit tests
         run: npx vitest run
+
+  smoke:
+    # Manual trigger only. Plaid Sandbox is free, but we keep CI
+    # workflow runs predictable.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      # Repo / org secrets (configure in GitHub Settings → Secrets and
+      # variables → Actions). Sandbox keys are free at
+      # https://dashboard.plaid.com/.
+      PLAID_CLIENT_ID: ${{ secrets.PLAID_CLIENT_ID_SANDBOX }}
+      PLAID_SECRET: ${{ secrets.PLAID_SECRET_SANDBOX }}
+      PLAID_ENV: sandbox
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+      - name: Install dependencies
+        run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      - name: Run Plaid sandbox smoke test
+        # No DB required — the script creates a sandbox Item, exchanges
+        # the public_token, and walks /transactions/sync without
+        # writing to Postgres. Pure connector exercise.
+        run: npx tsx scripts/smoke-test-plaid.ts

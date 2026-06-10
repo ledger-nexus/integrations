@@ -8,9 +8,26 @@ import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { formatRelativeTime } from "@/lib/utils/format";
 import { TriggerSyncButton } from "./trigger-sync-button";
+import { getCurrentTenant } from "@/lib/auth/session";
 
 export default async function ConnectionsListPage() {
+  // SECURITY (pen-test pass 4 follow-up): tenant-scope the enumeration.
+  // Connection has no direct tenantId column, so we walk
+  // Connection.targetId → BankAccount.entity.tenantId. This mirrors how
+  // triggerSyncAction tenant-checks the connection it's about to sync.
+  const tenant = await getCurrentTenant();
+  const tenantBankAccountIds = tenant
+    ? (
+        await prisma.bankAccount.findMany({
+          where: { entity: { tenantId: tenant.id } },
+          select: { id: true },
+        })
+      ).map((b) => b.id)
+    : [];
   const connections = await prisma.connection.findMany({
+    where: tenant
+      ? { targetType: "BANK_ACCOUNT", targetId: { in: tenantBankAccountIds } }
+      : { id: "__none__" },
     orderBy: [{ status: "asc" }, { createdAt: "desc" }],
     select: {
       id: true,
@@ -20,6 +37,10 @@ export default async function ConnectionsListPage() {
       targetType: true,
       lastSyncedAt: true,
       lastSyncStatus: true,
+      scheduleEnabled: true,
+      syncIntervalMinutes: true,
+      nextSyncAt: true,
+      consecutiveFailureCount: true,
       createdAt: true,
       _count: { select: { syncRuns: true } },
     },
@@ -57,6 +78,7 @@ export default async function ConnectionsListPage() {
                   <TH>System</TH>
                   <TH>Target</TH>
                   <TH>Last sync</TH>
+                  <TH>Schedule</TH>
                   <TH className="text-right">Runs</TH>
                   <TH>Status</TH>
                   <TH>Action</TH>
@@ -81,6 +103,47 @@ export default async function ConnectionsListPage() {
                     <TD className="text-xs font-mono text-ink-600">{c.targetType}</TD>
                     <TD className="text-xs text-ink-500">
                       {formatRelativeTime(c.lastSyncedAt)}
+                    </TD>
+                    <TD className="text-xs">
+                      {c.scheduleEnabled && c.syncIntervalMinutes != null ? (
+                        <div className="flex flex-col gap-0.5">
+                          <div className="flex items-center gap-1">
+                            <Badge tone={c.consecutiveFailureCount > 0 ? "warning" : "positive"}>
+                              every {c.syncIntervalMinutes}m
+                            </Badge>
+                            {c.consecutiveFailureCount > 0 ? (
+                              <span
+                                title={`${c.consecutiveFailureCount} consecutive failure(s) — interval backed off`}
+                                className="text-[10px] font-mono text-amber-700"
+                              >
+                                ×{c.consecutiveFailureCount}
+                              </span>
+                            ) : null}
+                          </div>
+                          {c.nextSyncAt ? (
+                            <span className="text-[10px] text-ink-500">
+                              next {formatRelativeTime(c.nextSyncAt)}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : (
+                        // Schedule paused — but preserve the failure
+                        // signal if the operator paused mid-failure.
+                        // Without this, unpausing later silently
+                        // triggers an immediate backed-off interval,
+                        // which is surprising.
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-ink-400">off</span>
+                          {c.consecutiveFailureCount > 0 ? (
+                            <span
+                              title={`Paused while ${c.consecutiveFailureCount} consecutive failure(s) were pending. Unpausing without resetting the counter will start with a backed-off interval.`}
+                              className="text-[10px] font-mono text-amber-700"
+                            >
+                              ×{c.consecutiveFailureCount} pending
+                            </span>
+                          ) : null}
+                        </div>
+                      )}
                     </TD>
                     <TD className="text-right text-xs text-ink-600">
                       {c._count.syncRuns}

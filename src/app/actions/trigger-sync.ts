@@ -20,6 +20,7 @@ import {
   NotAuthenticatedError,
   NoTenantSelectedError,
 } from "@/lib/auth/session";
+import { requireRepoAccess, RepoNotIncludedError } from "@/lib/auth/repo-access";
 
 export interface TriggerSyncState {
   ok: boolean;
@@ -36,6 +37,7 @@ export async function triggerSyncAction(
   try {
     await requireCurrentUser();
     const tenant = await requireCurrentTenant();
+    requireRepoAccess(tenant);
 
     if (!connectionId) {
       return { ok: false, message: "connectionId required" };
@@ -89,6 +91,8 @@ export async function triggerSyncAction(
     if (e instanceof NotAuthenticatedError)
       return { ok: false, message: "You must be signed in." };
     if (e instanceof NoTenantSelectedError)
+      return { ok: false, message: e.message };
+    if (e instanceof RepoNotIncludedError)
       return { ok: false, message: e.message };
     return { ok: false, message: e instanceof Error ? e.message : "Unknown error" };
   }

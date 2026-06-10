@@ -103,10 +103,34 @@ export interface CompleteAuthResult {
  * plus the raw payload (for the staging table's frozen audit trail).
  */
 export interface FetchPage<TRecord> {
+  /** ADDED records — new transactions/rows on this page. */
   records: Array<{
     externalId: string;
     raw: TRecord;
   }>;
+  /**
+   * MODIFIED records — existing transactions the source system has
+   * retroactively corrected (amount fix, description change,
+   * date reclassification). Same shape as `records`; downstream
+   * consumers replace the prior values for the same externalId.
+   *
+   * Optional. Connectors that don't support modifications (or whose
+   * sync APIs don't surface them) omit this field entirely; the
+   * engine treats undefined the same as an empty array.
+   */
+  modifiedRecords?: Array<{
+    externalId: string;
+    raw: TRecord;
+  }>;
+  /**
+   * REMOVED records — source system says these transactions no
+   * longer exist (cancelled, voided, deleted). Only the externalId
+   * is provided; the engine matches against previously-staged
+   * records to find what to void downstream.
+   *
+   * Optional. Same default semantics as `modifiedRecords`.
+   */
+  removedExternalIds?: string[];
   /** Cursor to pass on the next call. null = no more pages. */
   nextCursor: string | null;
 }
@@ -142,10 +166,21 @@ export interface PushResult {
  * the route plumbing; the connector handles the wire format.
  */
 export interface VerifyWebhookInput {
+  /** Raw body bytes as a string. Critical: must be the bytes as received, NOT a re-stringification of JSON.parse(body). */
   rawBody: string;
-  headers: Record<string, string>;
+  /** Lowercased header map. Route handlers normalize before calling. */
+  headers: Record<string, string | undefined>;
   credentials?: ConnectorCredentials;
 }
+
+/**
+ * Result of webhook signature verification. We surface the failure
+ * reason so the route handler can audit-log it without having the
+ * verifier re-do that work.
+ */
+export type VerifyWebhookResult =
+  | { ok: true; kid?: string }
+  | { ok: false; reason: string };
 
 export interface ParseWebhookInput<TRecord> {
   body: unknown;
@@ -196,7 +231,16 @@ export interface Connector<TRecord, TPush = never> {
   pushRecord?(input: PushInput<TPush>): Promise<PushResult>;
 
   // ─── Webhook (optional; required if capabilities.webhook) ───────────────
-  verifyWebhookSignature?(input: VerifyWebhookInput): boolean;
+  /**
+   * Authenticate an inbound webhook. For HMAC-shaped signatures this can
+   * return synchronously; for JWT-shaped (Plaid, Stripe meter events
+   * inbound, etc.) it returns a Promise because the public key fetch is
+   * async + cached out-of-band. Returning a result object instead of a
+   * bare boolean lets the route handler audit-log the failure reason.
+   */
+  verifyWebhookSignature?(
+    input: VerifyWebhookInput
+  ): VerifyWebhookResult | Promise<VerifyWebhookResult>;
   parseWebhookEvent?(input: ParseWebhookInput<TRecord>): Promise<ParseWebhookResult<TRecord>>;
 }
 

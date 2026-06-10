@@ -38,89 +38,122 @@ datasource db {
 // targetType identifies where synced data writes downstream — for v0.1
 // only BANK_ACCOUNT is supported (target = a recon BankAccount).
 model Connection {
-  id               String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  systemCode       String           // "plaid", "stripe", "gusto", "bill_com", ...
-  displayName      String           // e.g. "Chase Operating ****1234"
-  status           ConnectionStatus @default(ACTIVE)
+  id          String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  systemCode  String // "plaid", "stripe", "gusto", "bill_com", ...
+  displayName String // e.g. "Chase Operating ****1234"
+  status      ConnectionStatus @default(ACTIVE)
 
   // The downstream object this connection feeds. v0.1: BANK_ACCOUNT
   // points at a recon BankAccount; v0.2 will add PARTY, GL_ACCOUNT,
   // VENDOR, etc. for other connectors.
-  targetType       ConnectionTargetType
-  targetId         String?          @db.Uuid
+  targetType ConnectionTargetType
+  targetId   String?              @db.Uuid
 
   // Connector-specific credentials. JSON blob — shape depends on
   // systemCode. For Plaid: { accessToken, itemId, institutionId,
   // institutionName, accountId }. Never logged; the engine treats it
   // as opaque.
-  credentialsJson  Json
+  credentialsJson Json
 
   // Last sync cursor (connector-defined string). For Plaid:
   // /transactions/sync returns a `next_cursor` we pass back on the
   // next call to get only new/updated transactions since.
-  lastCursor       String?
-  lastSyncedAt    DateTime?
-  lastSyncStatus  SyncStatus?
+  lastCursor     String?
+  lastSyncedAt   DateTime?
+  lastSyncStatus SyncStatus?
+
+  // Scheduled-sync configuration. The /api/cron/run-scheduled-syncs
+  // endpoint reads these to figure out which connections are due.
+  //
+  // scheduleEnabled: master switch. False = no auto-sync (manual +
+  //   webhook only). Operators flip this to pause without losing the
+  //   interval setting.
+  // syncIntervalMinutes: how often the scheduler tries this
+  //   connection. Bounded by the scheduler module (min 5 min, max
+  //   24h) — Plaid rate-limits aggressive polling and the bridge to
+  //   recon isn't free.
+  // nextSyncAt: when this connection is next due. Computed from
+  //   `lastSyncedAt + interval` (or `now() + interval` on a fresh
+  //   schedule). NULL = not on a schedule.
+  // lastScheduledRunAt: when the scheduler last attempted (even on
+  //   skip-locked or skip-status). Different from lastSyncedAt
+  //   (which only updates on actual sync attempts) so the operator
+  //   can debug "the cron fired but never picked this up".
+  // consecutiveFailureCount: rolling count of failures since the last
+  //   SUCCESS. The cron handler increments on every FAILURE/ERROR and
+  //   resets to 0 on SUCCESS. Drives exponential backoff in the
+  //   advance-next-sync-at math — a dead bank connection backs off
+  //   instead of flooding the cron tick every 5 min.
+  scheduleEnabled         Boolean   @default(false)
+  syncIntervalMinutes     Int?
+  nextSyncAt              DateTime?
+  lastScheduledRunAt      DateTime?
+  consecutiveFailureCount Int       @default(0)
 
   // Connection metadata. createdBy is the actor (User UUID or "system").
-  createdBy        String?
-  createdAt        DateTime         @default(now())
-  updatedAt        DateTime         @updatedAt
-  deactivatedAt    DateTime?
+  createdBy     String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  deactivatedAt DateTime?
 
-  syncRuns         SyncRun[]
+  syncRuns           SyncRun[]
+  plaidWebhookEvents PlaidWebhookEvent[]
 
   @@unique([systemCode, targetId])
   @@index([status, systemCode])
+  // Partial-friendly index for the scheduler's "what's due now?" query.
+  // Postgres can still use it for the (scheduleEnabled, nextSyncAt) range
+  // even without a WHERE clause on the index — fine for v0.2 scale.
+  @@index([scheduleEnabled, nextSyncAt])
   @@map("connection")
 }
 
 enum ConnectionStatus {
-  ACTIVE        // syncs happen on schedule
-  PAUSED        // connection exists but sync is off (auth needs refresh, etc.)
-  REVOKED       // user disconnected; tokens may be invalid
-  ERROR         // last sync failed; needs admin attention
+  ACTIVE // syncs happen on schedule
+  PAUSED // connection exists but sync is off (auth needs refresh, etc.)
+  REVOKED // user disconnected; tokens may be invalid
+  ERROR // last sync failed; needs admin attention
 }
 
 enum ConnectionTargetType {
-  BANK_ACCOUNT  // → recon BankAccount (Plaid for now)
+  BANK_ACCOUNT // → recon BankAccount (Plaid for now)
   // v0.2+: PARTY, GL_ACCOUNT, VENDOR, EMPLOYEE
 }
 
 // One row per sync attempt. Append-only; never edited. Captures what
 // happened on each run for the admin sync log + debugging.
 model SyncRun {
-  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  connectionId    String      @db.Uuid
-  connection      Connection  @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  connectionId String     @db.Uuid
+  connection   Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
 
-  startedAt       DateTime    @default(now())
-  completedAt     DateTime?
-  status          SyncStatus  @default(RUNNING)
+  startedAt   DateTime   @default(now())
+  completedAt DateTime?
+  status      SyncStatus @default(RUNNING)
 
   // How the sync was triggered. MANUAL = user clicked "sync now";
   // SCHEDULED = cron job (v0.2); WEBHOOK = inbound webhook (v0.2).
-  triggerType     SyncTriggerType
+  triggerType SyncTriggerType
 
   // Cursor state. cursorBefore = what we passed to the connector;
   // cursorAfter = what the connector returned for next time.
-  cursorBefore    String?
-  cursorAfter     String?
+  cursorBefore String?
+  cursorAfter  String?
 
   // Aggregate counts. recordsAdded includes new records the connector
   // reported; recordsModified = updates; recordsRemoved = soft-deletes
   // (the connector signaled the record is no longer valid).
-  recordsAdded    Int         @default(0)
-  recordsModified Int         @default(0)
-  recordsRemoved  Int         @default(0)
+  recordsAdded    Int @default(0)
+  recordsModified Int @default(0)
+  recordsRemoved  Int @default(0)
 
   // For failures.
-  errorCode       String?
-  errorMessage    String?
+  errorCode    String?
+  errorMessage String?
 
   // Backref to the staging records this run ingested. Cleaned up
   // after successful downstream write.
-  stagedRecords   ImportStagingRecord[]
+  stagedRecords ImportStagingRecord[]
 
   @@index([connectionId, startedAt])
   @@map("sync_run")
@@ -129,8 +162,64 @@ model SyncRun {
 enum SyncStatus {
   RUNNING
   SUCCESS
-  PARTIAL_SUCCESS  // some records failed downstream write but cursor advanced
-  FAILURE          // sync failed; cursor NOT advanced
+  PARTIAL_SUCCESS // some records failed downstream write but cursor advanced
+  FAILURE // sync failed; cursor NOT advanced
+}
+
+/// Audit trail for inbound Plaid webhooks. Every received payload
+/// persists here regardless of whether it triggered a sync — gives
+/// the operator a way to debug "did Plaid actually send us X?".
+///
+/// Idempotency: webhooks are routinely re-delivered (Plaid retries
+/// on non-2xx for 24h). We don't currently dedupe by request id;
+/// the downstream effect (triggerSync) is itself idempotent via the
+/// Plaid /transactions/sync cursor, so a repeated TRANSACTIONS webhook
+/// just produces one or zero new records.
+model PlaidWebhookEvent {
+  id           String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// The Connection this webhook was for, resolved by Plaid item_id.
+  /// Null when the webhook is unrouted (item_id didn't match any
+  /// active Connection — usually a stale webhook from a removed item).
+  connectionId String?     @db.Uuid
+  connection   Connection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+
+  /// Plaid's item_id from the payload. Preserved even when connectionId
+  /// is null so the operator can debug unrouted events.
+  plaidItemId String
+
+  webhookType String // e.g. "TRANSACTIONS", "ITEM"
+  webhookCode String // e.g. "SYNC_UPDATES_AVAILABLE", "ERROR"
+
+  /// Verbatim payload as Plaid sent it.
+  rawPayload    Json
+  /// Was a sync triggered as a result?
+  triggeredSync Boolean @default(false)
+  /// SyncRun id if triggeredSync (or null if no sync fired or it failed
+  /// before the run row was created).
+  syncRunId     String? @db.Uuid
+
+  /// Why the webhook was acted on (or skipped). Free-form for
+  /// auditing.
+  outcome        String // "SYNC_TRIGGERED" / "ITEM_ERROR_RECORDED" / "IGNORED" / "FAILED"
+  outcomeMessage String?
+
+  /// How the request was authenticated:
+  ///   "JWT"       — Plaid-Verification ES256 JWT verified end-to-end
+  ///   "URL_TOKEN" — legacy URL-token gate matched, JWT not present/verified
+  ///   "DEV_OPEN"  — dev mode, no auth required (NODE_ENV != production)
+  ///                 — never expected to appear in prod audit rows
+  /// Filter on this to audit which webhooks bypassed the strong auth path.
+  verificationMethod String?
+  /// Key id (`kid`) of the JWK that signed a JWT-verified request. Lets
+  /// operators trace which Plaid signing key was in use during a window
+  /// (useful when Plaid announces key rotations).
+  verificationKid    String?
+
+  receivedAt DateTime @default(now())
+
+  @@index([connectionId, receivedAt])
+  @@index([plaidItemId, receivedAt])
+  @@map("plaid_webhook_event")
 }
 
 enum SyncTriggerType {
@@ -147,40 +236,59 @@ enum SyncTriggerType {
 // rawPayload is the original, verbatim record from the connector.
 // Frozen, for re-mapping when the mapper logic evolves.
 model ImportStagingRecord {
-  id              String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  syncRunId       String      @db.Uuid
-  syncRun         SyncRun     @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  syncRunId String  @db.Uuid
+  syncRun   SyncRun @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
 
   // The connector's external id for this record. Used for idempotency:
   // re-running a sync should NOT create duplicates.
-  externalId      String
+  externalId String
+
+  /// Operation type signaled by the connector.
+  ///   ADDED — new transaction (default; the v0.1 case)
+  ///   MODIFIED — existing transaction had its amount/description/date
+  ///     corrected by the source system. Plaid signals these on its
+  ///     /transactions/sync response. The mapped payload is the
+  ///     UPDATED shape; downstream consumers replace the prior values.
+  ///   REMOVED — source system says this transaction no longer exists
+  ///     (cancelled/voided). rawPayload + mappedPayload are null;
+  ///     externalId is enough to identify which line to void downstream.
+  recordOp StagingRecordOp @default(ADDED)
 
   // Raw record from the connector (frozen). For Plaid: the full
-  // Transaction object as returned by /transactions/sync.
-  rawPayload      Json
+  // Transaction object as returned by /transactions/sync. Null for
+  // REMOVED records (the connector only gives us the externalId).
+  rawPayload Json?
 
   // After mapping. Shape varies by connection.targetType.
-  // For BANK_ACCOUNT: a BankStatementLine-shaped object.
-  mappedPayload   Json?
+  // For BANK_ACCOUNT: a BankStatementLine-shaped object. Null for
+  // REMOVED records.
+  mappedPayload Json?
 
   // Status of the downstream write.
   writeStatus     StagingWriteStatus @default(PENDING)
   writeError      String?
   writtenRecordId String?            @db.Uuid
 
-  createdAt       DateTime    @default(now())
-  writtenAt       DateTime?
+  createdAt DateTime  @default(now())
+  writtenAt DateTime?
 
   @@unique([syncRunId, externalId])
   @@index([writeStatus, createdAt])
   @@map("import_staging_record")
 }
 
+enum StagingRecordOp {
+  ADDED
+  MODIFIED
+  REMOVED
+}
+
 enum StagingWriteStatus {
-  PENDING      // sync ingested it but downstream write hasn't happened
-  WRITTEN      // promoted to downstream successfully
-  FAILED       // downstream write errored; will be retried
-  SKIPPED      // intentional skip (e.g., duplicate detected, filtered out)
+  PENDING // sync ingested it but downstream write hasn't happened
+  WRITTEN // promoted to downstream successfully
+  FAILED // downstream write errored; will be retried
+  SKIPPED // intentional skip (e.g., duplicate detected, filtered out)
 }
 
 // =========================================================================
@@ -194,13 +302,13 @@ enum StagingWriteStatus {
 // /api/internal/journal-entries).
 
 model LegalEntity {
-  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id                   String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   // SECURITY (pen-test pass 4): tenantId added so Server Actions
   // can tenant-scope record lookups. Column exists in shared DB.
-  tenantId             String   @db.Uuid
+  tenantId             String  @db.Uuid
   code                 String
   name                 String
-  parentEntityId       String?  @db.Uuid
+  parentEntityId       String? @db.Uuid
   functionalCurrencyId String
   sourceSystem         String?
   sourceRecordType     String?
@@ -218,19 +326,19 @@ model LegalEntity {
 }
 
 model Account {
-  id               String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  entityId         String? @db.Uuid
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entityId         String?  @db.Uuid
   code             String
   name             String
   type             String
   normalBalance    String
   subtype          String?
-  isContra         Boolean @default(false)
-  isControlAccount Boolean @default(false)
-  isBank           Boolean @default(false)
-  parentAccountId  String? @db.Uuid
+  isContra         Boolean  @default(false)
+  isControlAccount Boolean  @default(false)
+  isBank           Boolean  @default(false)
+  parentAccountId  String?  @db.Uuid
   bookScope        String[] @default([])
-  active           Boolean @default(true)
+  active           Boolean  @default(true)
 
   bankAccounts BankAccount[]
 
@@ -249,11 +357,11 @@ model Account {
 }
 
 model BankAccount {
-  id                 String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  entityId           String  @db.Uuid
-  entity             LegalEntity @relation(fields: [entityId], references: [id])
-  accountId          String  @db.Uuid
-  account            Account     @relation(fields: [accountId], references: [id])
+  id        String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entityId  String      @db.Uuid
+  entity    LegalEntity @relation(fields: [entityId], references: [id])
+  accountId String      @db.Uuid
+  account   Account     @relation(fields: [accountId], references: [id])
 
   code               String  @unique
   displayName        String
@@ -262,7 +370,7 @@ model BankAccount {
   currencyId         String  @default("USD")
   isActive           Boolean @default(true)
 
-  statements         BankStatement[]
+  statements BankStatement[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -271,45 +379,45 @@ model BankAccount {
 }
 
 model BankStatement {
-  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  bankAccountId   String   @db.Uuid
-  bankAccount     BankAccount @relation(fields: [bankAccountId], references: [id])
+  id            String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bankAccountId String      @db.Uuid
+  bankAccount   BankAccount @relation(fields: [bankAccountId], references: [id])
 
-  filename        String
-  uploadedAt      DateTime @default(now())
-  uploadedBy      String?
-  format          String   // e.g. "PLAID_SYNC_V1" for integrations-imported statements
-  rawPayload      String
+  filename   String
+  uploadedAt DateTime @default(now())
+  uploadedBy String?
+  format     String // e.g. "PLAID_SYNC_V1" for integrations-imported statements
+  rawPayload String
 
-  periodStart     DateTime @db.Date
-  periodEnd       DateTime @db.Date
-  openingBalance  Decimal  @db.Decimal(18, 4)
-  closingBalance  Decimal  @db.Decimal(18, 4)
+  periodStart    DateTime @db.Date
+  periodEnd      DateTime @db.Date
+  openingBalance Decimal  @db.Decimal(18, 4)
+  closingBalance Decimal  @db.Decimal(18, 4)
 
-  lines           BankStatementLine[]
+  lines BankStatementLine[]
 
-  totalLines      Int @default(0)
-  matchedLines    Int @default(0)
-  pendingLines    Int @default(0)
+  totalLines   Int @default(0)
+  matchedLines Int @default(0)
+  pendingLines Int @default(0)
 
   @@index([bankAccountId, periodEnd])
   @@map("bank_statement")
 }
 
 model BankStatementLine {
-  id              String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  statementId     String @db.Uuid
-  statement       BankStatement @relation(fields: [statementId], references: [id], onDelete: Cascade)
+  id          String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  statementId String        @db.Uuid
+  statement   BankStatement @relation(fields: [statementId], references: [id], onDelete: Cascade)
 
   lineNo          Int
-  transactionDate DateTime @db.Date
+  transactionDate DateTime  @db.Date
   postedDate      DateTime? @db.Date
   description     String
-  amount          Decimal @db.Decimal(18, 4)
-  runningBalance  Decimal? @db.Decimal(18, 4)
+  amount          Decimal   @db.Decimal(18, 4)
+  runningBalance  Decimal?  @db.Decimal(18, 4)
   externalRef     String?
 
-  status          String @default("UNMATCHED")
+  status String @default("UNMATCHED")
 
   @@unique([statementId, lineNo])
   @@index([statementId, status])
@@ -319,20 +427,25 @@ model BankStatementLine {
 
 // Shared multi-tenancy mirror (pen-test pass 4).
 model User {
-  id          String  @id @db.Uuid
-  email       String  @unique
+  id          String             @id @db.Uuid
+  email       String             @unique
   displayName String
-  isActive    Boolean @default(true)
+  isActive    Boolean            @default(true)
   memberships TenantMembership[]
 
   @@map("app_user")
 }
 
 model Tenant {
-  id          String  @id @db.Uuid
-  slug        String  @unique
-  name        String
-  memberships TenantMembership[]
+  id                 String             @id @db.Uuid
+  slug               String             @unique
+  name               String
+  /// Mirror of ledger-core's Tenant.billingPlan + subscriptionStatus.
+  /// session.requireRepoAccess() reads these to gate by plan.
+  /// integrations is the most-restricted repo — only Scale plan includes it.
+  billingPlan        String?
+  subscriptionStatus String?
+  memberships        TenantMembership[]
 
   @@map("tenant")
 }

@@ -1,3 +1,18 @@
+<!-- BEGIN multi-session-orchestrator amendment (v1) -->
+
+## ⚠️ Multi-session coordination (READ FIRST)
+
+This repo may have parallel Claude sessions — they clobber each other's writes without coordination.
+
+1. **Read `STATUS.md`** at the repo root before editing any file. If your task overlaps an active claim, pick a different task or surface the conflict to the user.
+2. **Claim your scope** before your first edit: append a `### Session <id>` block to STATUS.md under "Active claims" with scope / files-globs / branch / heartbeat (format documented in STATUS.md). Commit STATUS.md atomically.
+3. **Heartbeat** every ~20 turns. Small commit.
+4. **Release** at session end: move your block to "Recent completions" with an outcome line. Commit.
+
+Never edit another session's claim, skip the read, or claim `**`.
+
+<!-- END multi-session-orchestrator amendment -->
+
 # Claude Code Instructions for integrations
 
 Auto-loaded by Claude Code on every session in this repo.
@@ -21,6 +36,18 @@ The architecture canon is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Read i
 4. **No flow engine.** Per-event handlers in TypeScript code, not a visual flow builder. Zapier / Make / n8n already do that; our value is the deep, accounting-aware connectors.
 
 5. **Cursor advances ONLY on successful sync.** Failed syncs leave the cursor untouched so the next attempt picks up the same window. This is the whole point of `/transactions/sync`-style cursor APIs vs. timestamp-based pagination.
+
+6. **All error emission goes through the monitoring shim.** `src/lib/monitoring/index.ts` is the canonical path — `captureError(err, context)` / `captureMessage(msg, level, context)`. Every emit runs `redactPii()` before the error reaches Sentry or the console fallback. **Never call Sentry directly + never console.error a Plaid/Stripe error's `.message`** — vendor errors regularly embed the raw access token + transaction descriptions. **Load-bearing for integrations:** a leaked OAuth `accessToken` in Sentry's UI is a Critical incident class (attacker gets bank/Stripe/Gusto access). The shim's `sanitizeErrorForCapture()` strips the V8 stack preamble so `.message` PII can't leak via `.stack` (14th adversarial pass closure 2026-06-05). Add new field names to `src/lib/soc2/redact-pii.ts` allowlist when new vendor identifiers ship — `plaidItemId`, `stripeCustomerId`, `gustoEmployeeId`, `linkToken` were added in the 14th-pass closure.
+
+## SOC 2 + adversarial-pass cadence
+
+This repo is part of the ledger-nexus portfolio's SOC 2 Type 2 readiness program. Current state (per `ledger-core/docs/SOC2_READINESS.md`): **≈80% to Type 1 audit-ready**.
+
+**Adversarial-pass discipline:** every substantive code shipment (new connector, webhook receiver, OAuth flow, monitoring code, anything cross-tenant-touching) should be followed by an adversarial-pass audit before merge. The portfolio has run **14 adversarial passes** to date; the 14th-pass closure on the Sentry shim is the LOAD-BEARING case here:
+
+- **14th pass (2026-06-05 night):** found Error.stack PII leak via V8 preamble (Confidentiality TSC) + integrations vendor-identifier gaps in PII allowlist — closed via integrations PR #18 2nd commit. The integrations port pins a Critical-tier test: `"Plaid sync failed for token plk-secret-abcdef-12345"` cannot reach Sentry's index via the sanitized stack.
+
+The cadence is the evidence: SOC 2 CC4 (Monitoring Activities) auditors grade "this team finds + closes their own weaknesses." A self-discovered HIGH closed in-session with tests pinning the attack scenario is the highest-confidence CC4 evidence form. **When you ship something load-bearing (especially OAuth flows + webhook receivers), run an adversarial pass before declaring done.**
 
 ## What's wired (v0.1)
 
@@ -79,8 +106,26 @@ The sync runner advances `Connection.lastCursor` ONLY on `SUCCESS`. On failure, 
 
 Same conventions as ledger-core / recon / revenue-rec: App Router, Server Components by default, Server Actions for mutations, inline UI primitives in `src/components/ui/`. The one Client Component is `<PlaidLinkButton />` because Plaid Link requires React hooks for the widget lifecycle.
 
+### Testing
+- Tests run against a real Postgres (via `DATABASE_URL`). Don't mock the DB.
+- **Self-healing `beforeAll`** — tests that create tenants / entities / accounts with stable prefixes MUST scrub orphans of that prefix BEFORE seeding. The shared dev DB is global; a killed `vitest` run (Ctrl-C, OOM, signal) skips `afterAll` and leaves residue. Without the self-heal, the next run trips on stale rows — often silently (cross-tenant Prisma queries without explicit tenant scope can pick up leaked rows from other tenants). The pattern: `prisma.tenant.findMany({ where: { slug: { startsWith: "<prefix>" } } })` → cascade-delete child rows → delete tenant. Costs ~1 query on the happy path; pays for itself the first time a sweep is interrupted. Reference implementation in ledger-core: `tests/tenant-account-resolution.test.ts:beforeAll` (PR #194). Portfolio-wide pattern shipped 2026-06-09.
+
 ## How to start a session
 
 1. Read this file.
 2. Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the connector pattern + cross-repo write story).
 3. Confirm: does this work belong in integrations (third-party data pulls / pushes) or in recon (matching) / ledger-core (substrate writes)?
+
+## SOC 2 / Deficiency-log re-audit pattern (institutionalized 2026-06-06)
+
+**Before opening an engineering PR to close a tracked deficiency in `docs/policies/control-deficiency-log.md`, re-audit whether the closure is already on main.** The deficiency log can lag architectural reality — a status flip from Open → Remediated may be a doc PR away, not engineering work.
+
+**Re-audit playbook** (proven in ledger-core — closed the only Critical-severity Open deficiency via doc-only PRs):
+
+1. Read the deficiency row's "Description" carefully — what's the attack/gap?
+2. `git log --all --oneline -- <relevant_file_path>` — does main have a commit addressing it?
+3. `git show main:<path>` — does the layered defense already exist?
+4. Look for verification tests (`tests/<feature>.test.ts`)
+5. If all three answer YES, the deficiency is **Remediated**. Open a doc-only PR flipping the status + amending readiness % + risk register score.
+
+This pattern surfaces hidden Remediated state that would otherwise sit as Open in the log, creating a false picture of audit-readiness.

@@ -106,6 +106,10 @@ The sync runner advances `Connection.lastCursor` ONLY on `SUCCESS`. On failure, 
 
 Same conventions as ledger-core / recon / revenue-rec: App Router, Server Components by default, Server Actions for mutations, inline UI primitives in `src/components/ui/`. The one Client Component is `<PlaidLinkButton />` because Plaid Link requires React hooks for the widget lifecycle.
 
+### Testing
+- Tests run against a real Postgres (via `DATABASE_URL`). Don't mock the DB.
+- **Self-healing `beforeAll`** — tests that create tenants / entities / accounts with stable prefixes MUST scrub orphans of that prefix BEFORE seeding. The shared dev DB is global; a killed `vitest` run (Ctrl-C, OOM, signal) skips `afterAll` and leaves residue. Without the self-heal, the next run trips on stale rows — often silently (cross-tenant Prisma queries without explicit tenant scope can pick up leaked rows from other tenants). The pattern: `prisma.tenant.findMany({ where: { slug: { startsWith: "<prefix>" } } })` → cascade-delete child rows → delete tenant. Costs ~1 query on the happy path; pays for itself the first time a sweep is interrupted. Reference implementation in ledger-core: `tests/tenant-account-resolution.test.ts:beforeAll` (PR #194). Portfolio-wide pattern shipped 2026-06-09.
+
 ## How to start a session
 
 1. Read this file.

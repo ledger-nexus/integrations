@@ -12,6 +12,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient, ConnectionStatus } from "@prisma/client";
 
+const HAS_DB = !!process.env.DATABASE_URL;
+
 const prisma = new PrismaClient();
 
 // Sentinel uuid for the test subject. Stable across runs so cleanup
@@ -28,15 +30,17 @@ async function cleanup() {
 }
 
 beforeAll(async () => {
+  if (!HAS_DB) return;
   await cleanup();
 });
 
 afterAll(async () => {
+  if (!HAS_DB) return;
   await cleanup();
   await prisma.$disconnect();
 });
 
-describe("connectionsAttribution — integration vs real Postgres", () => {
+describe.skipIf(!HAS_DB)("connectionsAttribution — integration vs real Postgres", () => {
   it("returns empty-but-valid shape for a user with no connections", async () => {
     const { connectionsAttribution } = await import(
       "../src/lib/privacy/connections-export"

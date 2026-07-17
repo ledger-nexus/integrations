@@ -112,6 +112,34 @@ The engine (sync runner, webhook router) is recordType-agnostic. It dispatches o
 
 **v0.1 (historical)**: integrations wrote directly to recon's `BankStatement` + `BankStatementLine` via the shared Postgres database. This was the same shape as recon's pre-bridge "shared DB" period and was always intended to be temporary. The bridge function name and signature (`promoteToBankStatement`) stayed identical across the refactor, so callers needed zero changes.
 
+## Schema-safety protocol (shared database)
+
+integrations' `prisma/schema.prisma` declares only a **subset** of the shared
+Postgres database: its own tables (`connection`, `sync_run`,
+`import_staging_record`) plus read-only mirrors of ledger-core-owned
+(Tenant, TenantMembership, User, LegalEntity, Account, Currency) and
+recon-owned (BankAccount, BankStatement, BankStatementLine) models. Because
+of that subsetting, any push-style migration executes the FULL diff between
+the schema and the database — including DROP/ALTER statements against every
+shared table this repo doesn't declare, or declares incorrectly. xbrl-filer
+measured 284 statements (263 destructive) from exactly this pattern.
+Therefore:
+
+- **`prisma db push` and `prisma migrate dev` are banned** in this repo (the
+  npm scripts were removed; do not reintroduce them).
+- Schema changes to integrations-owned tables apply via
+  `npm run db:diff` (read-only `prisma migrate diff --script`) → review the
+  SQL and keep ONLY statements touching `connection` / `sync_run` /
+  `import_staging_record` and their enums → `npx prisma db execute --file
+  <reviewed.sql>`.
+- The mirror halves are **generated** from their owners' schemas
+  (ledger-core `main@9442667`, recon main — 2026-07-16), never hand-edited.
+  The mirror is FK-closed (every FK on a mirrored table resolves inside the
+  mirror), so `db:diff` produces **zero statements naming any mirrored
+  table**. A statement against a mirrored table in the diff means the mirror
+  has drifted: re-generate it from the owner's schema before doing anything
+  else.
+
 ## Plaid choice + architecture for v0.1
 
 Why Plaid first:

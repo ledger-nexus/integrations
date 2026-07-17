@@ -46,7 +46,13 @@ cp .env.example .env
 # Get free Plaid sandbox credentials at https://dashboard.plaid.com/
 # Set PLAID_CLIENT_ID + PLAID_SECRET in .env
 
-pnpm db:push      # creates connection / sync_run / import_staging_record tables
+# Create the integrations-owned tables via the reviewed-diff protocol
+# (NEVER `prisma db push` — this schema declares only a subset of the
+# shared DB, so a blind push emits destructive ALTERs against tables
+# owned by ledger-core / recon; see prisma/schema.prisma header):
+pnpm db:diff > /tmp/int-diff.sql   # read-only; review, keep ONLY connection /
+                                   # sync_run / import_staging_record statements
+npx prisma db execute --file /tmp/int-diff.reviewed.sql
 pnpm dev          # http://localhost:3003 — note: different port than ledger-core (3000), recon (3001), revenue-rec (3002)
 pnpm test         # 32 unit tests across mapper + connector-interface
 ```

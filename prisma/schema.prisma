@@ -1,18 +1,48 @@
 // integrations Prisma schema.
 //
-// Two halves, mirroring recon / revenue-rec's pattern:
+// Two halves, same pattern as recon / revenue-rec / xbrl-filer:
 //
-//   1. integrations-OWNED models (Connection, SyncRun, ImportStagingRecord,
-//      ConnectorAuthState). These represent the integration engine's own
-//      bookkeeping: which third-party systems are connected, what they
-//      synced, errors, etc.
+//   1. Shared-DB models integrations QUERIES but does NOT own:
 //
-//   2. recon-mirrored models (BankAccount, BankStatement, BankStatementLine
-//      and the LegalEntity / Account that recon itself mirrors from
-//      ledger-core). MUST stay in sync with recon's schema — column for
-//      column. recon owns these tables; integrations writes to them on
-//      sync (v0.1 direct DB write; v0.2 will refactor to HTTP POST to a
-//      recon internal endpoint for symmetry with the ledger-core bridge).
+//        - ledger-core-owned (Tenant, TenantMembership, User, LegalEntity,
+//          Account, Currency). Mirror of the canonical definitions in
+//          ledger-core's schema — column-for-column, relations trimmed to
+//          the mirrored set. GENERATED from ledger-core main commit
+//          9442667 (2026-07-16) — re-generate on upstream schema change,
+//          never hand-drift.
+//        - recon-owned (BankAccount, BankStatement, BankStatementLine).
+//          Mirror of recon main's definitions, same rules. integrations
+//          only READS these (Connection.targetId → BankAccount lookup);
+//          writes go through recon's POST /api/internal/bank-lines HTTP
+//          bridge (src/lib/recon-bridge.ts), never through Prisma.
+//
+//      integrations does NOT migrate any of these tables — their owners do.
+//
+//      The mirror is FK-CLOSED: every foreign key on a mirrored table
+//      points at another mirrored table, so `npm run db:diff` produces
+//      ZERO statements naming any mirrored table (shared-DB tables this
+//      schema doesn't declare at all appear only as DROP noise — filtered
+//      by the reviewed-diff protocol below, never applied). If the diff
+//      ever shows a statement against a mirrored table, the mirror has
+//      drifted — re-generate it from the owner's schema before doing
+//      anything else.
+//
+//   2. integrations-OWNED models (Connection, SyncRun,
+//      ImportStagingRecord). Schema changes to the shared DB are applied
+//      via a REVIEWED `prisma migrate diff` script — NEVER `prisma db
+//      push` or `migrate dev`. Because this schema declares only a subset
+//      of the shared database, a blind push would execute the full diff,
+//      including DROP/ALTER statements against every shared table this
+//      file doesn't declare (or declares incorrectly). Protocol:
+//
+//        1. npm run db:diff                    # migrate diff → SQL script
+//        2. Review: keep ONLY statements touching integrations-owned
+//           tables (connection, sync_run, import_staging_record) and
+//           integrations-owned enums (ConnectionStatus,
+//           ConnectionTargetType, SyncStatus, SyncTriggerType,
+//           StagingWriteStatus). Everything else is subset-of-shared-DB
+//           noise and MUST NOT run.
+//        3. npx prisma db execute --file <reviewed.sql>
 //
 // Shared DB: integrations connects with the same DATABASE_URL as
 // ledger-core, recon, and revenue-rec.
@@ -184,54 +214,185 @@ enum StagingWriteStatus {
 }
 
 // =========================================================================
-// recon mirror — DO NOT EDIT without syncing recon's schema upstream
+// ledger-core mirror — DO NOT EDIT without re-syncing from ledger-core
+// (generated from ledger-core main commit 9442667, 2026-07-16)
 // =========================================================================
-//
-// integrations writes to BankStatement + BankStatementLine on each Plaid
-// sync. This is a write into recon's owned tables — same arrangement as
-// recon writing to its own tables in v0.1. In v0.2 we'll refactor to POST
-// to a recon internal endpoint (the symmetric pattern to ledger-core's
-// /api/internal/journal-entries).
+
+enum TenantRole {
+  OWNER // cannot be removed; can delete the tenant
+  ADMIN // full read+write+admin (period close, user lifecycle)
+  MEMBER // read+write, no admin actions
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+enum NormalBalance {
+  DEBIT
+  CREDIT
+}
+
+enum TranslationCategory {
+  CURRENT_RATE
+  HISTORICAL
+  WEIGHTED_AVG
+  EXCLUDED
+}
+
+model Tenant {
+  id          String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  slug        String @unique // url-safe, e.g. "acme-co"
+  name        String
+  ownerUserId String @db.Uuid
+
+  memberships TenantMembership[]
+
+  // Backrefs from tenant-scoped domain models (mirrored subset only).
+  legalEntities LegalEntity[]
+  accounts      Account[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? // soft delete
+
+  @@index([ownerUserId])
+  @@map("tenant")
+}
+
+model TenantMembership {
+  id       String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId String     @db.Uuid
+  userId   String     @db.Uuid
+  role     TenantRole @default(MEMBER)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@unique([tenantId, userId])
+  @@index([userId])
+  @@map("tenant_membership")
+}
+
+model User {
+  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email         String    @unique
+  displayName   String
+  isActive      Boolean   @default(true)
+  deactivatedAt DateTime?
+
+  // Multi-tenancy: a User can belong to N Tenants via TenantMembership.
+  // User itself is global (no tenantId) — login lookup is global by email.
+  tenantMemberships TenantMembership[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("app_user")
+}
 
 model LegalEntity {
-  id                   String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  // SECURITY (pen-test pass 4): tenantId added so Server Actions
-  // can tenant-scope record lookups. Column exists in shared DB.
-  tenantId             String   @db.Uuid
-  code                 String
-  name                 String
-  parentEntityId       String?  @db.Uuid
-  functionalCurrencyId String
-  sourceSystem         String?
-  sourceRecordType     String?
-  sourceRecordId       String?
-  sourcePayload        Json?
-  mappingVersion       String?
-  extensions           Json?
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tenantId       String        @db.Uuid
+  tenant         Tenant        @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+  // Phase 4b: code is unique PER tenant. Two tenants can both own
+  // an entity coded "ACME" — collisions are isolated by tenantId.
+  code           String
+  name           String
+  parentEntityId String?       @db.Uuid
+  parent         LegalEntity?  @relation("EntityHierarchy", fields: [parentEntityId], references: [id])
+  children       LegalEntity[] @relation("EntityHierarchy")
 
+  // The currency this entity reports in. Each book may override for reporting.
+  functionalCurrencyId String
+  functionalCurrency   Currency @relation("EntityFunctionalCcy", fields: [functionalCurrencyId], references: [code])
+
+  // NetSuite OneWorld: one subsidiary per group is the "elimination
+  // subsidiary" — its only postings are the intercompany eliminations
+  // the consolidation engine generates.
+  isEliminationEntity Boolean @default(false)
+
+  // Lineage — null for natively-created entities; populated on ERP import.
+  sourceSystem     String?
+  sourceRecordType String?
+  sourceRecordId   String?
+  sourcePayload    Json?
+  mappingVersion   String?
+  extensions       Json?
+
+  accounts Account[]
+
+  // Backref to the recon-owned mirror below.
   bankAccounts BankAccount[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@unique([tenantId, code])
+  @@index([tenantId])
   @@map("legal_entity")
 }
 
+model Currency {
+  // ISO 4217 code is the primary key — these are stable.
+  code     String  @id // "USD", "EUR", "JPY"
+  name     String
+  decimals Int     @default(2) // 2 for USD, 0 for JPY, etc.
+  symbol   String?
+
+  entitiesFunctional LegalEntity[] @relation("EntityFunctionalCcy")
+
+  @@map("currency")
+}
+
 model Account {
-  id               String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  entityId         String? @db.Uuid
+  id String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+
+  tenantId String @db.Uuid
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  // entityId null = shared across all entities (consolidated chart).
+  entityId String?      @db.Uuid
+  entity   LegalEntity? @relation(fields: [entityId], references: [id])
+
+  // Human-readable code (e.g. "1000" for Cash). NOT a source-system primary key.
   code             String
   name             String
-  type             String
-  normalBalance    String
-  subtype          String?
-  isContra         Boolean @default(false)
-  isControlAccount Boolean @default(false)
-  isBank           Boolean @default(false)
-  parentAccountId  String? @db.Uuid
-  bookScope        String[] @default([])
-  active           Boolean @default(true)
+  type             AccountType
+  normalBalance    NormalBalance
+  subtype          String? // e.g. "CASH", "AR_TRADE", "INVENTORY_RAW"
+  isContra         Boolean       @default(false)
+  isControlAccount Boolean       @default(false) // true for AR/AP control accounts
+  isBank           Boolean       @default(false)
 
+  // ASC 830 / IAS 21: monetary accounts are re-measured at period-end CLOSE
+  // rate; non-monetary accounts stay at historical rate.
+  isMonetary Boolean @default(false)
+
+  // FX Phase 4 — ASC 830 translation method for CONSOLIDATION. Nullable so
+  // existing single-currency installations don't need a backfill.
+  translationCategory TranslationCategory?
+
+  parentAccountId String?   @db.Uuid
+  parent          Account?  @relation("AccountHierarchy", fields: [parentAccountId], references: [id])
+  children        Account[] @relation("AccountHierarchy")
+
+  // Books this account applies to. Empty = applies to all books.
+  bookScope String[] @default([])
+
+  active Boolean @default(true)
+
+  // BlackLine arc Phase 1: per-account override of the tenant default.
+  requiresReconReview Boolean?
+  reconTolerance      Decimal? @db.Decimal(20, 4)
+
+  // Backref to the recon-owned mirror below.
   bankAccounts BankAccount[]
 
   sourceSystem     String?
@@ -245,24 +406,48 @@ model Account {
   updatedAt DateTime @updatedAt
 
   @@unique([entityId, code])
+  @@index([type])
+  @@index([tenantId])
+  // Created by ledger-core's raw SQL (prisma/migrations/0001_constraints);
+  // declared here so db:diff stays clean (zero ledger-core statements).
+  @@index([extensions(ops: JsonbOps)], map: "account_extensions_gin", type: Gin)
   @@map("account")
 }
 
-model BankAccount {
-  id                 String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  entityId           String  @db.Uuid
-  entity             LegalEntity @relation(fields: [entityId], references: [id])
-  accountId          String  @db.Uuid
-  account            Account     @relation(fields: [accountId], references: [id])
+// =========================================================================
+// recon mirror — DO NOT EDIT without re-syncing from recon
+// (generated from recon main, 2026-07-16)
+// =========================================================================
+//
+// integrations only READS these tables (BankAccount lookup at connect /
+// sync time, BankStatement listing on the connection detail page). All
+// writes go through recon's POST /api/internal/bank-lines HTTP bridge —
+// see src/lib/recon-bridge.ts and docs/ARCHITECTURE.md.
 
-  code               String  @unique
+enum BankLineStatus {
+  UNMATCHED  // no match proposed yet
+  PROPOSED   // a match has been suggested (deterministic or AI)
+  MATCHED    // human approved the match
+  IGNORED    // human marked as not requiring reconciliation
+  ADJUSTMENT // human posted an adjustment JE to resolve the line
+}
+
+model BankAccount {
+  id       String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  entityId String      @db.Uuid
+  entity   LegalEntity @relation(fields: [entityId], references: [id])
+
+  accountId String  @db.Uuid
+  account   Account @relation(fields: [accountId], references: [id])
+
+  code               String  @unique // human-readable, e.g. "CHASE-OPERATING"
   displayName        String
   bankName           String?
   accountNumberLast4 String?
   currencyId         String  @default("USD")
   isActive           Boolean @default(true)
 
-  statements         BankStatement[]
+  statements BankStatement[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -271,80 +456,58 @@ model BankAccount {
 }
 
 model BankStatement {
-  id              String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  bankAccountId   String   @db.Uuid
-  bankAccount     BankAccount @relation(fields: [bankAccountId], references: [id])
+  id            String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  bankAccountId String      @db.Uuid
+  bankAccount   BankAccount @relation(fields: [bankAccountId], references: [id])
 
-  filename        String
-  uploadedAt      DateTime @default(now())
-  uploadedBy      String?
-  format          String   // e.g. "PLAID_SYNC_V1" for integrations-imported statements
-  rawPayload      String
+  // Source metadata
+  filename   String
+  uploadedAt DateTime @default(now())
+  uploadedBy String?
+  format     String // e.g. "PLAID_SYNC_V1" for integrations-imported statements
+  rawPayload String // verbatim source content for audit / re-parse
 
-  periodStart     DateTime @db.Date
-  periodEnd       DateTime @db.Date
-  openingBalance  Decimal  @db.Decimal(18, 4)
-  closingBalance  Decimal  @db.Decimal(18, 4)
+  // Statement period
+  periodStart    DateTime @db.Date
+  periodEnd      DateTime @db.Date
+  openingBalance Decimal  @db.Decimal(18, 4)
+  closingBalance Decimal  @db.Decimal(18, 4)
 
-  lines           BankStatementLine[]
+  lines BankStatementLine[]
 
-  totalLines      Int @default(0)
-  matchedLines    Int @default(0)
-  pendingLines    Int @default(0)
+  // Aggregate status for the UI
+  totalLines   Int @default(0)
+  matchedLines Int @default(0)
+  pendingLines Int @default(0)
 
   @@index([bankAccountId, periodEnd])
   @@map("bank_statement")
 }
 
 model BankStatementLine {
-  id              String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  statementId     String @db.Uuid
-  statement       BankStatement @relation(fields: [statementId], references: [id], onDelete: Cascade)
+  id          String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  statementId String        @db.Uuid
+  statement   BankStatement @relation(fields: [statementId], references: [id], onDelete: Cascade)
 
-  lineNo          Int
-  transactionDate DateTime @db.Date
+  lineNo          Int // 1-based order within the statement
+  transactionDate DateTime  @db.Date
   postedDate      DateTime? @db.Date
   description     String
-  amount          Decimal @db.Decimal(18, 4)
-  runningBalance  Decimal? @db.Decimal(18, 4)
-  externalRef     String?
+  // Signed: positive = deposit / inflow, negative = withdrawal / outflow.
+  amount         Decimal  @db.Decimal(18, 4)
+  runningBalance Decimal? @db.Decimal(18, 4)
+  externalRef    String? // bank's own transaction id when available
 
-  status          String @default("UNMATCHED")
+  status BankLineStatus @default(UNMATCHED)
+
+  // Audit trail for IGNORED status (recon v1.0). Populated by recon's
+  // ignoreLineAction; preserved across un-ignore.
+  ignoredAt    DateTime?
+  ignoredBy    String?
+  ignoreReason String?
 
   @@unique([statementId, lineNo])
   @@index([statementId, status])
   @@index([transactionDate])
   @@map("bank_statement_line")
-}
-
-// Shared multi-tenancy mirror (pen-test pass 4).
-model User {
-  id          String  @id @db.Uuid
-  email       String  @unique
-  displayName String
-  isActive    Boolean @default(true)
-  memberships TenantMembership[]
-
-  @@map("app_user")
-}
-
-model Tenant {
-  id          String  @id @db.Uuid
-  slug        String  @unique
-  name        String
-  memberships TenantMembership[]
-
-  @@map("tenant")
-}
-
-model TenantMembership {
-  tenantId String @db.Uuid
-  userId   String @db.Uuid
-  role     String
-
-  tenant Tenant @relation(fields: [tenantId], references: [id])
-  user   User   @relation(fields: [userId], references: [id])
-
-  @@unique([tenantId, userId])
-  @@map("tenant_membership")
 }

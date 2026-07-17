@@ -55,7 +55,7 @@ The cadence is the evidence: SOC 2 CC4 (Monitoring Activities) auditors grade "t
 - **Plaid connector** ([`src/lib/connectors/plaid/`](src/lib/connectors/plaid/)) — types, client wrapper, mapper, connector. Implements polling via `/transactions/sync`. Webhooks deferred to v0.2.
 - **Sync runner** ([`src/lib/sync/runner.ts`](src/lib/sync/runner.ts)) — orchestrator: load Connection → call connector.fetchSince → stage records → run mapper → promote to recon. Single-connection lock via `lastSyncStatus=RUNNING`.
 - **recon bridge** ([`src/lib/recon-bridge.ts`](src/lib/recon-bridge.ts)) — direct DB write to `BankStatement` + `BankStatementLine`. Idempotency via `externalRef` (Plaid transaction_id) dedup before insert.
-- **Schema** — Connection, SyncRun, ImportStagingRecord (owned) + LegalEntity, Account, BankAccount, BankStatement, BankStatementLine (mirrored from recon).
+- **Schema** — Connection, SyncRun, ImportStagingRecord (owned) + read-only mirrors of ledger-core-owned (Tenant, TenantMembership, User, LegalEntity, Account, Currency) and recon-owned (BankAccount, BankStatement, BankStatementLine) tables. The mirrors are GENERATED from the owners' schemas (ledger-core `main@9442667`, recon main — 2026-07-16), never hand-edited.
 - **UI** (port 3003): dashboard, connections list, connection detail, new-connection page with `<PlaidLinkButton />` Client Component.
 - **Tests**: 32 unit tests across mapper + connector-interface conformance. No DB needed; runs anywhere.
 
@@ -79,6 +79,13 @@ The cadence is the evidence: SOC 2 CC4 (Monitoring Activities) auditors grade "t
 - Tailwind + inlined UI primitives
 
 ## Rules for working in this codebase
+
+### Database / schema safety (shared DB — read this before any schema change)
+
+- integrations shares one Postgres database with ledger-core / recon / revenue-rec, and `prisma/schema.prisma` declares only a SUBSET of it. **`prisma db push` and `prisma migrate dev` are banned** — a push executes the full diff, including destructive ALTERs against shared tables this schema doesn't declare. The npm scripts were removed; do not reintroduce them.
+- Schema changes to integrations-owned tables (`connection`, `sync_run`, `import_staging_record`) go through the reviewed-diff protocol: `npm run db:diff` → keep ONLY statements touching integrations-owned tables/enums → `npx prisma db execute --file <reviewed.sql>`. See the `prisma/schema.prisma` header and `docs/ARCHITECTURE.md` "Schema-safety protocol".
+- The mirrored models (ledger-core's Tenant/TenantMembership/User/LegalEntity/Account/Currency, recon's BankAccount/BankStatement/BankStatementLine) are generated from their owners' schemas — never hand-drift them, and never write to them via Prisma (mirrors are read-only contracts; writes cross via HTTP bridges).
+- FK-closed invariant: `db:diff` must produce zero statements naming any mirrored table. If it doesn't, the mirror drifted — re-generate from the owner's schema before anything else.
 
 ### Adding a new connector
 

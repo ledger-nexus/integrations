@@ -44,7 +44,10 @@ Example:
 - **Outcome**: one-line result
 -->
 
-_No recent completions yet._
+### Session mirror-resync-int · 2026-07-16 (commit `7d3603e`)
+- **Scope**: re-sync stale ledger-core/recon schema mirror (main@9442667); ban `db push`, add reviewed-diff protocol
+- **Branch**: `claude/mirror-resync` (pushed; PR open)
+- **Outcome**: FK-closed mirror regenerated; db:diff now zero statements vs mirrored/owned tables; tsc clean; 73/73 tests
 
 ---
 
